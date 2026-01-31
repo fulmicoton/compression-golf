@@ -6,6 +6,7 @@ use std::io::{BufRead, BufReader};
 mod agavra;
 mod codec;
 mod fabinout;
+mod fulmicoton;
 mod hachikuji;
 mod jakedgy;
 mod naive;
@@ -17,6 +18,7 @@ mod zstd;
 use agavra::AgavraCodec;
 use codec::EventCodec;
 use fabinout::FabinoutCodec;
+use fulmicoton::FulmicotonCodec;
 use hachikuji::HachikujiCodec;
 use jakedgy::JakedgyCodec;
 use naive::NaiveCodec;
@@ -185,6 +187,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let codecs: Vec<(Box<dyn EventCodec>, &[(EventKey, EventValue)])> = vec![
         (Box::new(NaiveCodec::new()), &events),
+        (Box::new(FulmicotonCodec::new()), &sorted_events),
         (Box::new(ZstdCodec::new(9)), &events),
         // (Box::new(ZstdCodec::new(22)), &events), // commented out b/c it takes long to run
         (Box::new(AgavraCodec::new()), &sorted_events),
