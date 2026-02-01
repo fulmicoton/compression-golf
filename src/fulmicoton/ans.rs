@@ -326,6 +326,287 @@ fn read_vint_local(bytes: &[u8], offset: &mut usize) -> usize {
     n
 }
 
+pub struct Ans2048Bijection;
+
+const SCALE_BITS_2048: u32 = 14;
+const SCALE_2048: u32 = 1 << SCALE_BITS_2048;
+const STATE_LOWER_BOUND_2048: u32 = 1 << 20;
+
+impl Bijection<Vec<u16>, Vec<u8>> for Ans2048Bijection {
+    fn apply(&self, source: Vec<u16>) -> Vec<u8> {
+        if source.is_empty() { return vec![]; }
+
+        let mut counts = [0u32; 2048];
+        for &s in &source {
+            counts[s as usize] += 1;
+        }
+
+        let mut normalized_counts = [0u16; 2048];
+        let total = source.len() as u64;
+        let mut sum = 0u32;
+        let mut max_symbol = 0;
+        let mut max_count = 0;
+
+        for i in 0..2048 {
+            if counts[i] > 0 {
+                let mut c = (counts[i] as u64 * SCALE_2048 as u64 / total) as u32;
+                if c == 0 { c = 1; }
+                normalized_counts[i] = c as u16;
+                sum += c;
+                if c > max_count {
+                    max_count = c;
+                    max_symbol = i;
+                }
+            }
+        }
+
+        if sum != SCALE_2048 {
+            let diff = SCALE_2048 as i32 - sum as i32;
+            let val = normalized_counts[max_symbol] as i32 + diff;
+            normalized_counts[max_symbol] = val as u16;
+        }
+
+        let mut starts = [0u32; 2048];
+        let mut current_start = 0;
+        for i in 0..2048 {
+            starts[i] = current_start;
+            current_start += normalized_counts[i] as u32;
+        }
+
+        let mut stream = Vec::new();
+        let mut x = STATE_LOWER_BOUND_2048;
+
+        for &symbol in source.iter().rev() {
+            let s = symbol as usize;
+            let freq = normalized_counts[s] as u32;
+            let start = starts[s];
+
+            let bound = freq << (20 + 8 - SCALE_BITS_2048);
+            while x >= bound {
+                stream.push(x as u8);
+                x >>= 8;
+            }
+
+            x = ((x / freq) << SCALE_BITS_2048) + (x % freq) + start;
+        }
+
+        let x_bytes = x.to_le_bytes();
+        // Header: 2048 * 2 bytes for counts + 4 bytes length + 4 bytes state
+        let mut result = Vec::with_capacity(2048 * 2 + 4 + 4 + stream.len());
+        for &c in &normalized_counts {
+            result.extend_from_slice(&c.to_le_bytes());
+        }
+        result.extend_from_slice(&(source.len() as u32).to_le_bytes());
+        result.extend_from_slice(&x_bytes);
+        result.extend(stream.iter().rev());
+        result
+    }
+
+    fn revert(&self, source: Vec<u8>) -> Vec<u16> {
+        if source.is_empty() { return vec![]; }
+        let mut cursor = 0;
+        let mut normalized_counts = [0u16; 2048];
+        for i in 0..2048 {
+            let bytes = &source[cursor..cursor+2];
+            normalized_counts[i] = u16::from_le_bytes([bytes[0], bytes[1]]);
+            cursor += 2;
+        }
+
+        let mut cum_freq = [0u32; 2049];
+        let mut sum = 0;
+        for i in 0..2048 {
+            cum_freq[i] = sum;
+            sum += normalized_counts[i] as u32;
+        }
+        cum_freq[2048] = sum;
+
+        let mut symbol_map = vec![0u16; SCALE_2048 as usize];
+        for s in 0..2048 {
+            let start = cum_freq[s] as usize;
+            let end = cum_freq[s+1] as usize;
+            for i in start..end {
+                symbol_map[i] = s as u16;
+            }
+        }
+
+        let len_bytes = &source[cursor..cursor+4];
+        let length = u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
+        cursor += 4;
+
+        let state_bytes = &source[cursor..cursor+4];
+        let mut x = u32::from_le_bytes([state_bytes[0], state_bytes[1], state_bytes[2], state_bytes[3]]);
+        cursor += 4;
+
+        let mut output = Vec::with_capacity(length);
+        let stream = &source[cursor..];
+        let mut stream_ptr = 0;
+
+        for _ in 0..length {
+            let slot = (x & (SCALE_2048 - 1)) as usize;
+            let s = symbol_map[slot];
+            output.push(s);
+            let freq = normalized_counts[s as usize] as u32;
+            let start = cum_freq[s as usize];
+            x = freq * (x >> SCALE_BITS_2048) + (x & (SCALE_2048 - 1)) - start;
+            while x < STATE_LOWER_BOUND_2048 {
+                if stream_ptr >= stream.len() { break; }
+                let byte = stream[stream_ptr] as u32;
+                stream_ptr += 1;
+                x = (x << 8) | byte;
+            }
+        }
+        output
+    }
+}
+
+pub struct AnsU16Bijection {
+    pub alphabet_size: usize,
+}
+
+impl AnsU16Bijection {
+    pub fn new(alphabet_size: usize) -> Self {
+        Self { alphabet_size }
+    }
+
+    pub fn apply(&self, source: &[u16]) -> Vec<u8> {
+        if source.is_empty() { return vec![]; }
+
+        let alphabet_size = self.alphabet_size;
+
+        // Use 16-bit scale for larger alphabets
+        let scale_bits: u32 = 16;
+        let scale: u32 = 1 << scale_bits;
+        let state_lower_bound: u32 = 1 << 24;
+
+        let mut counts = vec![0u32; alphabet_size];
+        for &s in source {
+            counts[s as usize] += 1;
+        }
+
+        let mut normalized_counts = vec![0u16; alphabet_size];
+        let total = source.len() as u64;
+        let mut sum = 0u32;
+        let mut max_symbol = 0;
+        let mut max_count = 0;
+
+        for i in 0..alphabet_size {
+            if counts[i] > 0 {
+                let mut c = (counts[i] as u64 * scale as u64 / total) as u32;
+                if c == 0 { c = 1; }
+                normalized_counts[i] = c as u16;
+                sum += c;
+                if c > max_count {
+                    max_count = c;
+                    max_symbol = i;
+                }
+            }
+        }
+
+        if sum != scale {
+            let diff = scale as i32 - sum as i32;
+            let val = normalized_counts[max_symbol] as i32 + diff;
+            normalized_counts[max_symbol] = val as u16;
+        }
+
+        let mut starts = vec![0u32; alphabet_size];
+        let mut current_start = 0;
+        for i in 0..alphabet_size {
+            starts[i] = current_start;
+            current_start += normalized_counts[i] as u32;
+        }
+
+        let mut stream = Vec::new();
+        let mut x = state_lower_bound;
+
+        for &symbol in source.iter().rev() {
+            let s = symbol as usize;
+            let freq = normalized_counts[s] as u32;
+            let start = starts[s];
+
+            let bound = freq << (24 + 8 - scale_bits);
+            while x >= bound {
+                stream.push(x as u8);
+                x >>= 8;
+            }
+
+            x = ((x / freq) << scale_bits) + (x % freq) + start;
+        }
+
+        let x_bytes = x.to_le_bytes();
+        // Header: alphabet_size * 2 bytes for counts + 4 bytes length + 4 bytes state
+        let mut result = Vec::with_capacity(alphabet_size * 2 + 4 + 4 + stream.len());
+        for &c in &normalized_counts {
+            result.extend_from_slice(&c.to_le_bytes());
+        }
+        result.extend_from_slice(&(source.len() as u32).to_le_bytes());
+        result.extend_from_slice(&x_bytes);
+        result.extend(stream.iter().rev());
+        result
+    }
+
+    pub fn revert(&self, source: &[u8]) -> Vec<u16> {
+        if source.is_empty() { return vec![]; }
+
+        let alphabet_size = self.alphabet_size;
+        let scale_bits: u32 = 16;
+        let scale: u32 = 1 << scale_bits;
+        let state_lower_bound: u32 = 1 << 24;
+
+        let mut cursor = 0;
+        let mut normalized_counts = vec![0u16; alphabet_size];
+        for i in 0..alphabet_size {
+            let bytes = &source[cursor..cursor+2];
+            normalized_counts[i] = u16::from_le_bytes([bytes[0], bytes[1]]);
+            cursor += 2;
+        }
+
+        let mut cum_freq = vec![0u32; alphabet_size + 1];
+        let mut sum = 0;
+        for i in 0..alphabet_size {
+            cum_freq[i] = sum;
+            sum += normalized_counts[i] as u32;
+        }
+        cum_freq[alphabet_size] = sum;
+
+        let mut symbol_map = vec![0u16; scale as usize];
+        for s in 0..alphabet_size {
+            let start = cum_freq[s] as usize;
+            let end = cum_freq[s+1] as usize;
+            for i in start..end {
+                symbol_map[i] = s as u16;
+            }
+        }
+
+        let len_bytes = &source[cursor..cursor+4];
+        let length = u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
+        cursor += 4;
+
+        let state_bytes = &source[cursor..cursor+4];
+        let mut x = u32::from_le_bytes([state_bytes[0], state_bytes[1], state_bytes[2], state_bytes[3]]);
+        cursor += 4;
+
+        let mut output = Vec::with_capacity(length);
+        let stream = &source[cursor..];
+        let mut stream_ptr = 0;
+
+        for _ in 0..length {
+            let slot = (x & (scale - 1)) as usize;
+            let s = symbol_map[slot];
+            output.push(s);
+            let freq = normalized_counts[s as usize] as u32;
+            let start = cum_freq[s as usize];
+            x = freq * (x >> scale_bits) + (x & (scale - 1)) - start;
+            while x < state_lower_bound {
+                if stream_ptr >= stream.len() { break; }
+                let byte = stream[stream_ptr] as u32;
+                stream_ptr += 1;
+                x = (x << 8) | byte;
+            }
+        }
+        output
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,11 +614,11 @@ mod tests {
     #[test]
     fn test_ans_roundtrip() {
         let ans = AnsBijection;
-        
+
         let data = b"abracadabra".to_vec();
         let compressed = ans.apply(data.clone());
         let decompressed = ans.revert(compressed);
-        
+
         assert_eq!(data, decompressed);
     }
 
@@ -347,6 +628,25 @@ mod tests {
         let data = vec![1000, 2000, 1000, 3000, 2000, 1000, 5000];
         let compressed = ans.apply(data.clone());
         let decompressed = ans.revert(compressed);
+        assert_eq!(data, decompressed);
+    }
+
+    #[test]
+    fn test_ans_2048_roundtrip() {
+        let ans = Ans2048Bijection;
+        // Test with symbols in range 0-2047
+        let data: Vec<u16> = vec![0, 1, 2047, 100, 500, 2047, 0, 0, 1, 100];
+        let compressed = ans.apply(data.clone());
+        let decompressed = ans.revert(compressed);
+        assert_eq!(data, decompressed);
+    }
+
+    #[test]
+    fn test_ans_u16_roundtrip() {
+        let ans = AnsU16Bijection::new(65536);
+        let data: Vec<u16> = vec![0, 1, 65535, 100, 500, 65535, 0, 0, 1, 100, 32000];
+        let compressed = ans.apply(&data);
+        let decompressed = ans.revert(&compressed);
         assert_eq!(data, decompressed);
     }
 }
