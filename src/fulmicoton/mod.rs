@@ -1,5 +1,5 @@
-use bijection::{Bijection, ZStdBijection, VIntBijection, U24Bijection, DeltaBijection, ZigZagBijection, PositiveDeltaBijection, U64DeltaBijection};
-use columnar::{ColumnarEvents, EventsToColumns};
+use bijection::{Bijection, ZStdBijection, VIntBijection, U24Bijection, DeltaBijection, ZigZagBijection, PositiveDeltaBijection, U64DeltaBijection, HistogramBijection};
+use columnar::{ColumnarEvents, EventsToColumns, ParsedEvent, ParseBijection};
 use ans::AnsBijection;
 use bytes::Bytes;
 use std::borrow::Cow;
@@ -28,8 +28,11 @@ impl EventCodec for FulmicotonCodec {
         let mut events = events.to_vec();
         events.sort_by(|a, b| a.0.cmp(&b.0));
 
+        let parser = ParseBijection;
+        let parsed_events: Vec<ParsedEvent> = events.iter().map(|e| parser.apply(e)).collect();
+
         let transformer = EventsToColumns;
-        let cols = transformer.apply(Cow::Borrowed(&events));
+        let cols = transformer.apply(Cow::Owned(parsed_events));
         
         let zstd = ZStdBijection;
         let vint = VIntBijection;
@@ -159,8 +162,12 @@ impl EventCodec for FulmicotonCodec {
         };
 
         let transformer = EventsToColumns;
-        let cow = transformer.revert(cols);
-        Ok(cow.into_owned())
+        let parsed_events = transformer.revert(cols);
+        
+        let parser = ParseBijection;
+        let events: Vec<(EventKey, EventValue)> = parsed_events.iter().map(|e| parser.revert(e)).collect();
+        
+        Ok(events)
     }
 }
 

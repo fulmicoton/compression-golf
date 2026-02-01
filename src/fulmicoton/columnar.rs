@@ -5,6 +5,72 @@ use serde::{Deserialize, Serialize};
 use super::bijection::Bijection;
 use chrono::{DateTime, TimeZone, Utc};
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedEvent {
+    pub id: i64,
+    pub event_type: String,
+    pub repo_id: u64,
+    pub repo_owner: String,
+    pub repo_suffix: String,
+    pub created_at: i64,
+}
+
+pub struct ParseBijection;
+
+impl ParseBijection {
+    pub fn apply(&self, source: &(EventKey, EventValue)) -> ParsedEvent {
+        let (key, val) = source;
+        
+        let id = key.id.parse::<i64>().expect("Failed to parse event id");
+        let created_at = DateTime::parse_from_rfc3339(&val.created_at)
+            .expect("Failed to parse created_at")
+            .timestamp();
+            
+        let parts: Vec<&str> = val.repo.name.splitn(2, '/').collect();
+        let (repo_owner, repo_suffix) = if parts.len() == 2 {
+            (parts[0].to_string(), parts[1].to_string())
+        } else {
+            (val.repo.name.clone(), "".to_string())
+        };
+
+        ParsedEvent {
+            id,
+            event_type: key.event_type.clone(),
+            repo_id: val.repo.id,
+            repo_owner,
+            repo_suffix,
+            created_at,
+        }
+    }
+
+    pub fn revert(&self, source: &ParsedEvent) -> (EventKey, EventValue) {
+        let key = EventKey {
+            id: source.id.to_string(),
+            event_type: source.event_type.clone(),
+        };
+        
+        let dt = Utc.timestamp_opt(source.created_at, 0).unwrap();
+        let created_at = dt.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+        let repo_name = if source.repo_suffix.is_empty() {
+            source.repo_owner.clone()
+        } else {
+            format!("{}/{}", source.repo_owner, source.repo_suffix)
+        };
+
+        let val = EventValue {
+            repo: Repo {
+                id: source.repo_id,
+                name: repo_name.clone(),
+                url: format!("https://api.github.com/repos/{}", repo_name),
+            },
+            created_at,
+        };
+        
+        (key, val)
+    }
+}
+
 #[derive(Serialize, Deserialize, Default)]
 pub struct ColumnarEvents {
     // Event specific
@@ -22,8 +88,8 @@ pub struct ColumnarEvents {
 
 pub struct EventsToColumns;
 
-impl<'a> Bijection<Cow<'a, [(EventKey, EventValue)]>, ColumnarEvents> for EventsToColumns {
-    fn apply(&self, events: Cow<'a, [(EventKey, EventValue)]>) -> ColumnarEvents {
+impl<'a> Bijection<Cow<'a, [ParsedEvent]>, ColumnarEvents> for EventsToColumns {
+    fn apply(&self, events: Cow<'a, [ParsedEvent]>) -> ColumnarEvents {
         let events = events.as_ref();
         let mut cols = ColumnarEvents::default();
         
@@ -34,33 +100,32 @@ impl<'a> Bijection<Cow<'a, [(EventKey, EventValue)]>, ColumnarEvents> for Events
         cols.repo_indices.reserve(events.len());
 
         // 1. Build Repo Dictionary
-        let mut unique_repos: HashSet<(u64, String)> = HashSet::new();
-        for (_, val) in events {
-            unique_repos.insert((val.repo.id, val.repo.name.clone()));
+        // We use (repo_id, repo_owner, repo_suffix) as key to handle renames perfectly?
+        // Previously we used (id, name). Now name is split.
+        // So key is (id, owner, suffix).
+        let mut unique_repos: HashSet<(u64, String, String)> = HashSet::new();
+        for event in events {
+            unique_repos.insert((event.repo_id, event.repo_owner.clone(), event.repo_suffix.clone()));
         }
 
-        let mut sorted_repos: Vec<(u64, String)> = unique_repos.into_iter().collect();
-        sorted_repos.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let mut sorted_repos: Vec<(u64, String, String)> = unique_repos.into_iter().collect();
+        // Sort by ID, then Owner, then Suffix
+        sorted_repos.sort_by(|a, b| a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2)));
 
         let mut repo_to_index = HashMap::new();
-        for (i, (id, name)) in sorted_repos.into_iter().enumerate() {
-            repo_to_index.insert((id, name.clone()), i as u64);
+        for (i, (id, owner, suffix)) in sorted_repos.into_iter().enumerate() {
+            repo_to_index.insert((id, owner.clone(), suffix.clone()), i as u64);
             cols.dict_repo_ids.push(id);
-            
-            let parts: Vec<&str> = name.splitn(2, '/').collect();
-            if parts.len() == 2 {
-                cols.dict_repo_owners.push(parts[0].to_string());
-                cols.dict_repo_suffixes.push(parts[1].to_string());
-            } else {
-                cols.dict_repo_owners.push(name.clone());
-                cols.dict_repo_suffixes.push("".to_string());
-            }
+            cols.dict_repo_owners.push(owner);
+            cols.dict_repo_suffixes.push(suffix);
         }
 
         // 2. Build Event Type Dictionary
         let mut unique_event_types: HashSet<String> = HashSet::new();
-        for (key, _) in events {
-            unique_event_types.insert(key.event_type.clone());
+        for event in events {
+            unique_event_types.insert(event.event_type.clone());
         }
         let mut sorted_event_types: Vec<String> = unique_event_types.into_iter().collect();
         sorted_event_types.sort();
@@ -73,16 +138,15 @@ impl<'a> Bijection<Cow<'a, [(EventKey, EventValue)]>, ColumnarEvents> for Events
         }
 
         // 3. Encode Columns
-        for (key, val) in events {
-            cols.event_ids.push(key.id.parse::<i64>().expect("Failed to parse event id"));
+        for event in events {
+            cols.event_ids.push(event.id);
             
-            let et_idx = event_type_to_index.get(&key.event_type).expect("Event type not found");
+            let et_idx = event_type_to_index.get(&event.event_type).expect("Event type not found");
             cols.event_type_indices.push(*et_idx);
             
-            let dt = DateTime::parse_from_rfc3339(&val.created_at).expect("Failed to parse created_at");
-            cols.created_ats.push(dt.timestamp());
+            cols.created_ats.push(event.created_at);
             
-            let idx = repo_to_index.get(&(val.repo.id, val.repo.name.clone()))
+            let idx = repo_to_index.get(&(event.repo_id, event.repo_owner.clone(), event.repo_suffix.clone()))
                 .expect("Repo not found in dictionary");
             cols.repo_indices.push(*idx);
         }
@@ -90,7 +154,7 @@ impl<'a> Bijection<Cow<'a, [(EventKey, EventValue)]>, ColumnarEvents> for Events
         cols
     }
 
-    fn revert(&self, cols: ColumnarEvents) -> Cow<'a, [(EventKey, EventValue)]> {
+    fn revert(&self, cols: ColumnarEvents) -> Cow<'a, [ParsedEvent]> {
         let len = cols.event_ids.len();
         let mut events = Vec::with_capacity(len);
 
@@ -98,33 +162,19 @@ impl<'a> Bijection<Cow<'a, [(EventKey, EventValue)]>, ColumnarEvents> for Events
             let et_idx = cols.event_type_indices[i] as usize;
             let event_type = cols.dict_event_types[et_idx].clone();
 
-            let key = EventKey {
-                id: cols.event_ids[i].to_string(),
-                event_type,
-            };
-            
-            let dt = Utc.timestamp_opt(cols.created_ats[i], 0).unwrap();
-            let created_at = dt.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-
             let repo_idx = cols.repo_indices[i] as usize;
             let repo_id = cols.dict_repo_ids[repo_idx];
-            let owner = &cols.dict_repo_owners[repo_idx];
-            let suffix = &cols.dict_repo_suffixes[repo_idx];
-            let repo_name = if suffix.is_empty() {
-                owner.clone()
-            } else {
-                format!("{}/{}", owner, suffix)
-            };
+            let repo_owner = cols.dict_repo_owners[repo_idx].clone();
+            let repo_suffix = cols.dict_repo_suffixes[repo_idx].clone();
 
-            let val = EventValue {
-                repo: Repo {
-                    id: repo_id,
-                    name: repo_name.clone(),
-                    url: format!("https://api.github.com/repos/{}", repo_name),
-                },
-                created_at,
-            };
-            events.push((key, val));
+            events.push(ParsedEvent {
+                id: cols.event_ids[i],
+                event_type,
+                repo_id,
+                repo_owner,
+                repo_suffix,
+                created_at: cols.created_ats[i],
+            });
         }
         
         Cow::Owned(events)

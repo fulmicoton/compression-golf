@@ -188,15 +188,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     let codecs: Vec<(Box<dyn EventCodec>, &[(EventKey, EventValue)])> = vec![
         (Box::new(NaiveCodec::new()), &events),
         (Box::new(FulmicotonCodec::new()), &sorted_events),
-        (Box::new(ZstdCodec::new(9)), &events),
+        // (Box::new(ZstdCodec::new(9)), &events),
         // (Box::new(ZstdCodec::new(22)), &events), // commented out b/c it takes long to run
-        (Box::new(AgavraCodec::new()), &sorted_events),
-        (Box::new(FabinoutCodec::new()), &events),
-        (Box::new(HachikujiCodec::new()), &sorted_events),
-        (Box::new(XiangpengHaoCodec::new()), &sorted_events),
-        (Box::new(SamsondCodec::new()), &events),
-        (Box::new(JakedgyCodec::new()), &sorted_events),
-        (Box::new(NatebrennandCodec::new()), &sorted_events),
+        // (Box::new(AgavraCodec::new()), &sorted_events),
+        // (Box::new(FabinoutCodec::new()), &events),
+        // (Box::new(HachikujiCodec::new()), &sorted_events),
+        // (Box::new(XiangpengHaoCodec::new()), &sorted_events),
+        // (Box::new(SamsondCodec::new()), &events),
+        // (Box::new(JakedgyCodec::new()), &sorted_events),
+        // (Box::new(NatebrennandCodec::new()), &sorted_events),
     ];
 
     for (codec, expected) in codecs {
