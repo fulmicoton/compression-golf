@@ -1,4 +1,5 @@
 use std::error::Error;
+use super::algo::{identify_permutation, restore_permutation};
 
 pub trait Bijection<A, B> {
     fn apply(&self, source: A) -> B;
@@ -247,6 +248,106 @@ impl Bijection<Vec<i64>, Vec<u64>> for HistogramBijection {
     }
 }
 
+pub struct MonotonicPermutationBijection;
+
+impl Bijection<Vec<i64>, Vec<u8>> for MonotonicPermutationBijection {
+    fn apply(&self, source: Vec<i64>) -> Vec<u8> {
+        if source.is_empty() { return vec![]; }
+        
+        let min_val = *source.iter().min().unwrap();
+        let values: Vec<u64> = source.iter().map(|&x| (x - min_val) as u64).collect();
+        
+        let (sorted_u64, moves) = identify_permutation(values);
+        
+        // Encode sorted values using Histogram
+        let hist = HistogramBijection;
+        let vint = VIntBijection;
+        let zstd = ZStdBijection;
+        
+        let sorted_i64: Vec<i64> = sorted_u64.iter().map(|&x| x as i64).collect();
+        let hist_u64 = hist.apply(sorted_i64);
+        let sorted_bytes = zstd.apply(vint.apply(hist_u64));
+        
+        // Encode moves: [Count][Adv...][Bub...] -> Zstd
+        let mut moves_buf = Vec::new();
+        let count = moves.len();
+        write_vint_local(count, &mut moves_buf);
+        
+        for &(adv, _) in &moves {
+            write_vint_local(adv, &mut moves_buf);
+        }
+        for &(_, bub) in &moves {
+            write_vint_local(bub, &mut moves_buf);
+        }
+        
+        let moves_compressed = zstd.apply(moves_buf);
+        
+        // Output: [min_val(8B)] [LenSorted][SortedBytes] [LenMoves][MovesBytes]
+        let mut result = Vec::new();
+        result.extend_from_slice(&min_val.to_le_bytes());
+        
+        write_vint_local(sorted_bytes.len(), &mut result);
+        result.extend(sorted_bytes);
+        
+        write_vint_local(moves_compressed.len(), &mut result);
+        result.extend(moves_compressed);
+        
+        result
+    }
+
+    fn revert(&self, source: Vec<u8>) -> Vec<i64> {
+        if source.is_empty() { return vec![]; }
+        
+        let mut offset = 0;
+        let min_val_bytes = &source[offset..offset+8];
+        let min_val = i64::from_le_bytes([min_val_bytes[0], min_val_bytes[1], min_val_bytes[2], min_val_bytes[3], min_val_bytes[4], min_val_bytes[5], min_val_bytes[6], min_val_bytes[7]]);
+        offset += 8;
+        
+        let mut read_part = || {
+            let len = read_vint_local(&source, &mut offset);
+            let part = &source[offset..offset + len];
+            offset += len;
+            part.to_vec()
+        };
+        
+        let sorted_bytes = read_part();
+        let moves_compressed = read_part();
+        
+        let hist = HistogramBijection;
+        let vint = VIntBijection;
+        let zstd = ZStdBijection;
+        
+        // Decode sorted values
+        let hist_u64 = vint.revert(zstd.revert(sorted_bytes));
+        let sorted_i64 = hist.revert(hist_u64);
+        let values: Vec<u64> = sorted_i64.iter().map(|&x| x as u64).collect();
+        
+        // Decode moves
+        let moves_raw = zstd.revert(moves_compressed);
+        let mut moves = Vec::new();
+        let mut m_offset = 0;
+        if !moves_raw.is_empty() {
+            let count = read_vint_local(&moves_raw, &mut m_offset);
+            let mut advances = Vec::with_capacity(count);
+            for _ in 0..count {
+                advances.push(read_vint_local(&moves_raw, &mut m_offset));
+            }
+            let mut bubbles = Vec::with_capacity(count);
+            for _ in 0..count {
+                bubbles.push(read_vint_local(&moves_raw, &mut m_offset));
+            }
+            
+            for (adv, bub) in advances.into_iter().zip(bubbles.into_iter()) {
+                moves.push((adv, bub));
+            }
+        }
+        
+        let restored_values = restore_permutation(values, moves);
+        
+        restored_values.iter().map(|&x| (x as i64) + min_val).collect()
+    }
+}
+
 pub struct MonotonicRepairBijection;
 
 impl Bijection<Vec<i64>, Vec<u8>> for MonotonicRepairBijection {
@@ -275,11 +376,9 @@ impl Bijection<Vec<i64>, Vec<u8>> for MonotonicRepairBijection {
         let zstd = ZStdBijection;
         let pos_delta = PositiveDeltaBijection;
         
-        // Encode M (monotonic)
         let m_u64 = hist.apply(m);
         let m_bytes = zstd.apply(vint.apply(m_u64));
         
-        // Encode Offsets (non-decreasing)
         let offsets_u64 = pos_delta.apply(offsets);
         let offsets_bytes = zstd.apply(vint.apply(offsets_u64));
         

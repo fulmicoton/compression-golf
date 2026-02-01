@@ -1,6 +1,7 @@
-use bijection::{Bijection, ZStdBijection, VIntBijection, U24Bijection, DeltaBijection, ZigZagBijection, PositiveDeltaBijection, U64DeltaBijection, HistogramBijection};
+use bijection::{Bijection, ZStdBijection, VIntBijection, U24Bijection, PositiveDeltaBijection, U64DeltaBijection};
 use columnar::{ColumnarEvents, EventsToColumns, ParsedEvent, ParseBijection};
 use ans::AnsBijection;
+use timestamp::TimestampCodec;
 use bytes::Bytes;
 use std::borrow::Cow;
 use std::error::Error;
@@ -10,6 +11,8 @@ use crate::{EventKey, EventValue};
 mod bijection;
 mod columnar;
 mod ans;
+mod timestamp;
+mod algo;
 
 pub struct FulmicotonCodec;
 
@@ -37,17 +40,19 @@ impl EventCodec for FulmicotonCodec {
         let zstd = ZStdBijection;
         let vint = VIntBijection;
         let u24 = U24Bijection;
-        let delta = DeltaBijection;
-        let zigzag = ZigZagBijection;
         let pos_delta = PositiveDeltaBijection;
         let u64_delta = U64DeltaBijection;
         let ans = AnsBijection;
+        let ts_codec = TimestampCodec;
         
         // Compress columns
         let c_event_ids = zstd.apply(vint.apply(pos_delta.apply(cols.event_ids)));
         let c_event_type_indices = ans.apply(cols.event_type_indices);
         let c_dict_event_types = zstd.apply(cols.dict_event_types.join("\n").into_bytes());
-        let c_created_ats = zstd.apply(vint.apply(zigzag.apply(delta.apply(cols.created_ats))));
+        
+        // Timestamps: TimestampCodec (Permutation+Histogram+Ans) -> Zstd
+        let c_created_ats = zstd.apply(ts_codec.apply(cols.created_ats));
+        
         let c_repo_indices = zstd.apply(u24.apply(cols.repo_indices));
         let c_dict_repo_ids = zstd.apply(vint.apply(u64_delta.apply(cols.dict_repo_ids)));
         
@@ -84,7 +89,8 @@ impl EventCodec for FulmicotonCodec {
         Ok(Bytes::from(final_buf))
     }
 
-    fn decode(&self, bytes: &[u8]) -> Result<Vec<(EventKey, EventValue)>, Box<dyn Error>> {
+    fn decode(&self, bytes: &[
+u8]) -> Result<Vec<(EventKey, EventValue)>, Box<dyn Error>> {
         let mut offset = 0;
         let mut read_part = || {
             let len = read_vint(bytes, &mut offset);
@@ -104,11 +110,10 @@ impl EventCodec for FulmicotonCodec {
         let zstd = ZStdBijection;
         let vint = VIntBijection;
         let u24 = U24Bijection;
-        let delta = DeltaBijection;
-        let zigzag = ZigZagBijection;
         let pos_delta = PositiveDeltaBijection;
         let u64_delta = U64DeltaBijection;
         let ans = AnsBijection;
+        let ts_codec = TimestampCodec;
 
         // Decode dictionary names (owners + suffixes)
         let names_bytes = zstd.revert(c_dict_repo_names);
@@ -152,7 +157,8 @@ impl EventCodec for FulmicotonCodec {
             event_type_indices: ans.revert(c_event_type_indices),
             dict_event_types,
             
-            created_ats: delta.revert(zigzag.revert(vint.revert(zstd.revert(c_created_ats)))),
+            // Timestamps: Zstd -> TimestampCodec
+            created_ats: ts_codec.revert(zstd.revert(c_created_ats)),
             
             repo_indices: u24.revert(zstd.revert(c_repo_indices)),
             
@@ -165,7 +171,10 @@ impl EventCodec for FulmicotonCodec {
         let parsed_events = transformer.revert(cols);
         
         let parser = ParseBijection;
-        let events: Vec<(EventKey, EventValue)> = parsed_events.iter().map(|e| parser.revert(e)).collect();
+        let mut events: Vec<(EventKey, EventValue)> = parsed_events.iter().map(|e| parser.revert(e)).collect();
+        
+        // Sort back to EventKey order (ID, Type) to satisfy main.rs check
+        events.sort_by(|a, b| a.0.cmp(&b.0));
         
         Ok(events)
     }
