@@ -7,7 +7,7 @@ mod agavra;
 mod codec;
 // mod fabinout;
 mod fulmicoton;
-mod fulmicoton2;
+// mod fulmicoton2;
 // mod hachikuji;
 // mod jakedgy;
 mod naive;
@@ -20,7 +20,6 @@ use agavra::AgavraCodec;
 use codec::EventCodec;
 // use fabinout::FabinoutCodec;
 use fulmicoton::FulmicotonCodec;
-use fulmicoton2::Fulmicoton2Codec;
 // use hachikuji::HachikujiCodec;
 // use jakedgy::JakedgyCodec;
 use naive::NaiveCodec;
@@ -190,7 +189,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let codecs: Vec<(Box<dyn EventCodec>, &[(EventKey, EventValue)])> = vec![
         (Box::new(NaiveCodec::new()), &events),
         (Box::new(FulmicotonCodec::new()), &sorted_events),
-        (Box::new(Fulmicoton2Codec::new()), &sorted_events),
+        // (Box::new(Fulmicoton2Codec::new()), &sorted_events),
         // (Box::new(ZstdCodec::new(9)), &events),
         // (Box::new(ZstdCodec::new(22)), &events), // commented out b/c it takes long to run
         // (Box::new(AgavraCodec::new()), &sorted_events),

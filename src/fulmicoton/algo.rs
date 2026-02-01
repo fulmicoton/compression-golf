@@ -5,15 +5,15 @@ pub fn identify_permutation(mut values: Vec<u64>) -> (Vec<u64>, Vec<(usize, usiz
 
     // We effectively perform an insertion sort
     while i < values.len() {
-        if values[i] >= values[i-1] {
+        if values[i] >= values[i - 1] {
             advance_count += 1;
             i += 1;
         } else {
             // Need to bubble backwards
             let mut bubble_count = 0;
             let mut j = i;
-            while j > 0 && values[j] < values[j-1] {
-                values.swap(j, j-1);
+            while j > 0 && values[j] < values[j - 1] {
+                values.swap(j, j - 1);
                 j -= 1;
                 bubble_count += 1;
             }

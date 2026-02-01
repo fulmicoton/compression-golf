@@ -1,5 +1,5 @@
-use std::error::Error;
 use lzma::EXTREME_PRESET;
+use std::error::Error;
 
 use crate::zstd::ZstdCodec;
 
@@ -104,7 +104,6 @@ impl Bijection<Vec<u64>, Vec<u8>> for U24Bijection {
     }
 }
 
-
 // impl Bijection<Vec<u64>, Vec<u8>> for U24Bijection {
 //     fn apply(&self, numbers: Vec<u64>) -> Vec<u8> {
 //         let mut lanes = [Vec::new(), Vec::new(), Vec::new()];
@@ -138,7 +137,9 @@ pub struct DeltaBijection;
 
 impl Bijection<Vec<i64>, Vec<i64>> for DeltaBijection {
     fn apply(&self, source: Vec<i64>) -> Vec<i64> {
-        if source.is_empty() { return vec![]; }
+        if source.is_empty() {
+            return vec![];
+        }
         let mut deltas = Vec::with_capacity(source.len());
         let mut prev = 0;
         for &val in &source {
@@ -164,7 +165,9 @@ pub struct PositiveDeltaBijection;
 
 impl Bijection<Vec<i64>, Vec<u64>> for PositiveDeltaBijection {
     fn apply(&self, source: Vec<i64>) -> Vec<u64> {
-        if source.is_empty() { return vec![]; }
+        if source.is_empty() {
+            return vec![];
+        }
         let mut deltas = Vec::with_capacity(source.len());
         let mut prev = 0;
         for &val in &source {
@@ -194,7 +197,9 @@ pub struct U64DeltaBijection;
 
 impl Bijection<Vec<u64>, Vec<u64>> for U64DeltaBijection {
     fn apply(&self, source: Vec<u64>) -> Vec<u64> {
-        if source.is_empty() { return vec![]; }
+        if source.is_empty() {
+            return vec![];
+        }
         let mut deltas = Vec::with_capacity(source.len());
         let mut prev = 0;
         for &val in &source {
@@ -245,21 +250,23 @@ pub struct HistogramBijection;
 
 impl Bijection<Vec<i64>, Vec<u64>> for HistogramBijection {
     fn apply(&self, source: Vec<i64>) -> Vec<u64> {
-        if source.is_empty() { return vec![]; }
+        if source.is_empty() {
+            return vec![];
+        }
 
         let min = source[0];
         let max = source[source.len() - 1];
 
         // Ensure sorted
-        for i in 0..source.len()-1 {
-            if source[i] > source[i+1] {
+        for i in 0..source.len() - 1 {
+            if source[i] > source[i + 1] {
                 panic!("HistogramBijection: not sorted at index {}", i);
             }
         }
 
         let range = (max - min + 1) as usize;
         if range > 50_000_000 {
-             panic!("HistogramBijection: range too large {}", range);
+            panic!("HistogramBijection: range too large {}", range);
         }
 
         let mut counts = vec![0u64; range];
@@ -275,7 +282,9 @@ impl Bijection<Vec<i64>, Vec<u64>> for HistogramBijection {
     }
 
     fn revert(&self, source: Vec<u64>) -> Vec<i64> {
-        if source.is_empty() { return vec![]; }
+        if source.is_empty() {
+            return vec![];
+        }
 
         let min = source[0] as i64;
         let counts = &source[1..];
@@ -299,7 +308,9 @@ pub struct MonotonicPermutationBijection;
 
 impl Bijection<Vec<i64>, Vec<u8>> for MonotonicPermutationBijection {
     fn apply(&self, source: Vec<i64>) -> Vec<u8> {
-        if source.is_empty() { return vec![]; }
+        if source.is_empty() {
+            return vec![];
+        }
 
         let min_val = *source.iter().min().unwrap();
         let values: Vec<u64> = source.iter().map(|&x| (x - min_val) as u64).collect();
@@ -345,11 +356,22 @@ impl Bijection<Vec<i64>, Vec<u8>> for MonotonicPermutationBijection {
     }
 
     fn revert(&self, source: Vec<u8>) -> Vec<i64> {
-        if source.is_empty() { return vec![]; }
+        if source.is_empty() {
+            return vec![];
+        }
 
         let mut offset = 0;
-        let min_val_bytes = &source[offset..offset+8];
-        let min_val = i64::from_le_bytes([min_val_bytes[0], min_val_bytes[1], min_val_bytes[2], min_val_bytes[3], min_val_bytes[4], min_val_bytes[5], min_val_bytes[6], min_val_bytes[7]]);
+        let min_val_bytes = &source[offset..offset + 8];
+        let min_val = i64::from_le_bytes([
+            min_val_bytes[0],
+            min_val_bytes[1],
+            min_val_bytes[2],
+            min_val_bytes[3],
+            min_val_bytes[4],
+            min_val_bytes[5],
+            min_val_bytes[6],
+            min_val_bytes[7],
+        ]);
         offset += 8;
 
         let mut read_part = || {
@@ -393,7 +415,10 @@ impl Bijection<Vec<i64>, Vec<u8>> for MonotonicPermutationBijection {
 
         let restored_values = restore_permutation(values, moves);
 
-        restored_values.iter().map(|&x| (x as i64) + min_val).collect()
+        restored_values
+            .iter()
+            .map(|&x| (x as i64) + min_val)
+            .collect()
     }
 }
 
@@ -401,7 +426,9 @@ pub struct MonotonicRepairBijection;
 
 impl Bijection<Vec<i64>, Vec<u8>> for MonotonicRepairBijection {
     fn apply(&self, source: Vec<i64>) -> Vec<u8> {
-        if source.is_empty() { return vec![]; }
+        if source.is_empty() {
+            return vec![];
+        }
 
         let mut m = Vec::with_capacity(source.len());
         let mut offsets = Vec::with_capacity(source.len());
@@ -409,15 +436,15 @@ impl Bijection<Vec<i64>, Vec<u8>> for MonotonicRepairBijection {
         let mut prev_m = i64::MIN;
 
         for &t in &source {
-             let mut val = t + current_offset;
-             if val < prev_m {
-                 let diff = prev_m - val;
-                 current_offset += diff;
-                 val = prev_m;
-             }
-             m.push(val);
-             offsets.push(current_offset);
-             prev_m = val;
+            let mut val = t + current_offset;
+            if val < prev_m {
+                let diff = prev_m - val;
+                current_offset += diff;
+                val = prev_m;
+            }
+            m.push(val);
+            offsets.push(current_offset);
+            prev_m = val;
         }
 
         let hist = HistogramBijection;
@@ -441,7 +468,9 @@ impl Bijection<Vec<i64>, Vec<u8>> for MonotonicRepairBijection {
     }
 
     fn revert(&self, source: Vec<u8>) -> Vec<i64> {
-        if source.is_empty() { return vec![]; }
+        if source.is_empty() {
+            return vec![];
+        }
 
         let mut offset = 0;
         let mut read_part = || {
