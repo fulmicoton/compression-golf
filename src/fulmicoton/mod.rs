@@ -1,19 +1,22 @@
-use bijection::{Bijection, VIntBijection, U24Bijection, PositiveDeltaBijection, U64DeltaBijection, MonotonicPermutationBijection};
-use bijection::ZStdBijection as GeneralCompression;
-use columnar::{ColumnarEvents, EventsToColumns, ParsedEvent, ParseBijection};
-use ans::{AnsBijection, Ans2048Bijection};
-use std::collections::HashMap;
-use bytes::Bytes;
-use std::borrow::Cow;
-use std::error::Error;
 use crate::codec::EventCodec;
 use crate::{EventKey, EventValue};
+use ans::{Ans2048Bijection, AnsBijection};
+use bijection::ZStdBijection as GeneralCompression;
+use bijection::{
+    Bijection, EliasFanoBijection, MonotonicPermutationBijection, PositiveDeltaBijection,
+    U24Bijection, U64DeltaBijection, VIntBijection,
+};
+use bytes::Bytes;
+use columnar::{ColumnarEvents, EventsToColumns, ParseBijection, ParsedEvent};
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::error::Error;
 
+mod algo;
+mod ans;
 mod bijection;
 mod columnar;
-mod ans;
 mod timestamp;
-mod algo;
 
 pub struct FulmicotonCodec;
 
@@ -48,14 +51,17 @@ impl EventCodec for FulmicotonCodec {
         // Compress columns
         let c_event_ids = general_compression.apply(vint.apply(pos_delta.apply(cols.event_ids)));
         let c_event_type_indices = ans.apply(cols.event_type_indices);
-        let c_dict_event_types = general_compression.apply(cols.dict_event_types.join("\n").into_bytes());
+        let c_dict_event_types =
+            general_compression.apply(cols.dict_event_types.join("\n").into_bytes());
 
         // Timestamps: MonotonicPermutationBijection (internal Histogram + AnsU64)
         let c_created_ats = perm.apply(cols.created_ats);
 
         // Hybrid encoding for repo indices: top 2047 via ANS, rest via U24+Zstd
         let c_repo_indices = encode_repo_indices_hybrid(&cols.repo_indices);
-        let c_dict_repo_ids = general_compression.apply(vint.apply(u64_delta.apply(cols.dict_repo_ids)));
+        // Elias-Fano + Zstd encoding for sorted repo IDs
+        let elias_fano = EliasFanoBijection;
+        let c_dict_repo_ids = general_compression.apply(elias_fano.apply(cols.dict_repo_ids));
 
         // Combine repo owners and suffixes
         let joined_owners = cols.dict_repo_owners.join("\n");
@@ -79,8 +85,13 @@ impl EventCodec for FulmicotonCodec {
         // Concatenate with VInt lengths
         let mut final_buf = Vec::new();
         let parts: Vec<Vec<u8>> = vec![
-            c_event_ids, c_event_type_indices, c_dict_event_types, c_created_ats,
-            c_repo_indices, c_dict_repo_ids, c_dict_repo_names
+            c_event_ids,
+            c_event_type_indices,
+            c_dict_event_types,
+            c_created_ats,
+            c_repo_indices,
+            c_dict_repo_ids,
+            c_dict_repo_names,
         ];
 
         for part in parts {
@@ -119,10 +130,13 @@ impl EventCodec for FulmicotonCodec {
         let names_bytes = general_compression.revert(c_dict_repo_names);
         let names_vec = names_bytes;
         // Find separator
-        let sep_pos = names_vec.iter().position(|&b| b == 0).expect("Missing separator in repo names");
+        let sep_pos = names_vec
+            .iter()
+            .position(|&b| b == 0)
+            .expect("Missing separator in repo names");
 
         let owners_bytes = &names_vec[..sep_pos];
-        let suffixes_bytes = &names_vec[sep_pos+1..];
+        let suffixes_bytes = &names_vec[sep_pos + 1..];
 
         let owners_str = String::from_utf8(owners_bytes.to_vec())?;
         let dict_repo_owners: Vec<String> = if owners_str.is_empty() {
@@ -163,7 +177,8 @@ impl EventCodec for FulmicotonCodec {
             // Hybrid decoding for repo indices
             repo_indices: decode_repo_indices_hybrid(c_repo_indices),
 
-            dict_repo_ids: u64_delta.revert(vint.revert(general_compression.revert(c_dict_repo_ids))),
+            // Elias-Fano + Zstd decoding for sorted repo IDs
+            dict_repo_ids: EliasFanoBijection.revert(general_compression.revert(c_dict_repo_ids)),
             dict_repo_owners,
             dict_repo_suffixes,
         };
@@ -172,7 +187,8 @@ impl EventCodec for FulmicotonCodec {
         let parsed_events = transformer.revert(cols);
 
         let parser = ParseBijection;
-        let mut events: Vec<(EventKey, EventValue)> = parsed_events.iter().map(|e| parser.revert(e)).collect();
+        let mut events: Vec<(EventKey, EventValue)> =
+            parsed_events.iter().map(|e| parser.revert(e)).collect();
 
         // Sort back to EventKey order (ID, Type) to satisfy main.rs check
         events.sort_by(|a, b| a.0.cmp(&b.0));
@@ -195,7 +211,11 @@ fn encode_repo_indices_hybrid(repo_indices: &[u64]) -> Vec<u8> {
     freq_vec.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     let top_count = freq_vec.len().min(2047);
-    let top_repos: Vec<u64> = freq_vec.iter().take(top_count).map(|(idx, _)| *idx).collect();
+    let top_repos: Vec<u64> = freq_vec
+        .iter()
+        .take(top_count)
+        .map(|(idx, _)| *idx)
+        .collect();
 
     // Create mapping: original_index -> ANS symbol
     let mut index_to_symbol: HashMap<u64, u16> = HashMap::new();
@@ -230,9 +250,17 @@ fn encode_repo_indices_hybrid(repo_indices: &[u64]) -> Vec<u8> {
     let c_mapping = zstd.apply(vint.apply(top_repos));
 
     println!("    repo_indices hybrid breakdown:");
-    println!("      mapping table: {} bytes ({} top repos)", c_mapping.len(), top_count);
+    println!(
+        "      mapping table: {} bytes ({} top repos)",
+        c_mapping.len(),
+        top_count
+    );
     println!("      ANS symbols:   {} bytes", c_symbols.len());
-    println!("      other indices: {} bytes ({} items)", c_other.len(), other_count);
+    println!(
+        "      other indices: {} bytes ({} items)",
+        c_other.len(),
+        other_count
+    );
 
     // Combine: [len_mapping][mapping][len_symbols][symbols][other]
     let mut result = Vec::new();

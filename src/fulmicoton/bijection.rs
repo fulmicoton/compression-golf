@@ -224,6 +224,183 @@ impl Bijection<Vec<u64>, Vec<u64>> for U64DeltaBijection {
     }
 }
 
+pub struct EliasFanoBijection;
+
+impl Bijection<Vec<u64>, Vec<u8>> for EliasFanoBijection {
+    fn apply(&self, source: Vec<u64>) -> Vec<u8> {
+        if source.is_empty() {
+            return vec![];
+        }
+
+        let n = source.len() as u64;
+        let max_val = *source.last().unwrap();
+
+        // Calculate optimal low_bits: floor(log2(max_val / n))
+        // If max_val < n, use 0 low bits
+        let low_bits = if max_val >= n {
+            (max_val / n).ilog2() as usize
+        } else {
+            0
+        };
+        let low_mask = (1u64 << low_bits).wrapping_sub(1);
+
+        // Store low bits as fixed-width integers
+        let mut low_parts: Vec<u64> = Vec::with_capacity(source.len());
+        for &val in &source {
+            low_parts.push(val & low_mask);
+        }
+
+        // Build high bits bitvector using unary coding
+        // For each element, the high part is val >> low_bits
+        // We encode as: (high - prev_high) zeros followed by a one
+        let mut high_bits: Vec<u8> = Vec::new();
+        let mut current_byte = 0u8;
+        let mut bit_pos = 0usize;
+
+        let mut prev_high = 0u64;
+        for &val in &source {
+            let high = val >> low_bits;
+            let zeros = high - prev_high;
+
+            // Write 'zeros' zero bits
+            for _ in 0..zeros {
+                // bit is 0, just advance
+                bit_pos += 1;
+                if bit_pos == 8 {
+                    high_bits.push(current_byte);
+                    current_byte = 0;
+                    bit_pos = 0;
+                }
+            }
+
+            // Write a 1 bit
+            current_byte |= 1 << bit_pos;
+            bit_pos += 1;
+            if bit_pos == 8 {
+                high_bits.push(current_byte);
+                current_byte = 0;
+                bit_pos = 0;
+            }
+
+            prev_high = high;
+        }
+
+        // Flush remaining bits
+        if bit_pos > 0 {
+            high_bits.push(current_byte);
+        }
+
+        // Serialize: [n: u32] [low_bits: u8] [high_bits_len: u32] [high_bits] [low_parts packed]
+        let mut result = Vec::new();
+        result.extend_from_slice(&(source.len() as u32).to_le_bytes());
+        result.push(low_bits as u8);
+        result.extend_from_slice(&(high_bits.len() as u32).to_le_bytes());
+        result.extend_from_slice(&high_bits);
+
+        // Pack low parts: each is low_bits wide
+        if low_bits > 0 {
+            let mut packed_low = Vec::new();
+            let mut current: u64 = 0;
+            let mut bits_in_current = 0usize;
+
+            for &low in &low_parts {
+                current |= low << bits_in_current;
+                bits_in_current += low_bits;
+
+                while bits_in_current >= 8 {
+                    packed_low.push(current as u8);
+                    current >>= 8;
+                    bits_in_current -= 8;
+                }
+            }
+
+            if bits_in_current > 0 {
+                packed_low.push(current as u8);
+            }
+
+            result.extend_from_slice(&packed_low);
+        }
+
+        result
+    }
+
+    fn revert(&self, source: Vec<u8>) -> Vec<u64> {
+        if source.is_empty() {
+            return vec![];
+        }
+
+        let mut offset = 0;
+
+        let n = u32::from_le_bytes([source[0], source[1], source[2], source[3]]) as usize;
+        offset += 4;
+
+        let low_bits = source[offset] as usize;
+        offset += 1;
+
+        let high_bits_len = u32::from_le_bytes([
+            source[offset],
+            source[offset + 1],
+            source[offset + 2],
+            source[offset + 3],
+        ]) as usize;
+        offset += 4;
+
+        let high_bits = &source[offset..offset + high_bits_len];
+        offset += high_bits_len;
+
+        let packed_low = &source[offset..];
+        let low_mask = (1u64 << low_bits).wrapping_sub(1);
+
+        // Decode high bits from unary
+        let mut values = Vec::with_capacity(n);
+        let mut current_high = 0u64;
+        let mut bit_idx = 0usize;
+
+        while values.len() < n {
+            let byte_idx = bit_idx / 8;
+            let bit_in_byte = bit_idx % 8;
+
+            if byte_idx >= high_bits.len() {
+                break;
+            }
+
+            let bit = (high_bits[byte_idx] >> bit_in_byte) & 1;
+            if bit == 1 {
+                // Found an element
+                values.push(current_high);
+            } else {
+                // Increment high value
+                current_high += 1;
+            }
+            bit_idx += 1;
+        }
+
+        // Decode low bits and combine
+        if low_bits > 0 {
+            let mut low_bit_offset = 0usize;
+
+            for i in 0..n {
+                let byte_start = low_bit_offset / 8;
+                let bit_start = low_bit_offset % 8;
+
+                // Read up to 8 bytes to get enough bits
+                let mut raw = 0u64;
+                for j in 0..8 {
+                    if byte_start + j < packed_low.len() {
+                        raw |= (packed_low[byte_start + j] as u64) << (j * 8);
+                    }
+                }
+
+                let low = (raw >> bit_start) & low_mask;
+                values[i] = (values[i] << low_bits) | low;
+                low_bit_offset += low_bits;
+            }
+        }
+
+        values
+    }
+}
+
 pub struct ZigZagBijection;
 
 impl Bijection<Vec<i64>, Vec<u64>> for ZigZagBijection {
