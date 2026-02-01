@@ -5,26 +5,26 @@ use std::io::{BufRead, BufReader};
 
 mod agavra;
 mod codec;
-mod fabinout;
+// mod fabinout;
 mod fulmicoton;
-mod hachikuji;
-mod jakedgy;
+// mod hachikuji;
+// mod jakedgy;
 mod naive;
-mod natebrennand;
-mod samsond;
-mod xiangpenghao;
+// mod natebrennand;
+// mod samsond;
+// mod xiangpenghao;
 mod zstd;
 
 use agavra::AgavraCodec;
 use codec::EventCodec;
-use fabinout::FabinoutCodec;
+// use fabinout::FabinoutCodec;
 use fulmicoton::FulmicotonCodec;
-use hachikuji::HachikujiCodec;
-use jakedgy::JakedgyCodec;
+// use hachikuji::HachikujiCodec;
+// use jakedgy::JakedgyCodec;
 use naive::NaiveCodec;
-use natebrennand::NatebrennandCodec;
-use samsond::SamsondCodec;
-use xiangpenghao::XiangpengHaoCodec;
+// use natebrennand::NatebrennandCodec;
+// use samsond::SamsondCodec;
+// use xiangpenghao::XiangpengHaoCodec;
 use zstd::ZstdCodec;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
