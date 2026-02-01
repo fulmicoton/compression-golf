@@ -1,7 +1,6 @@
-use bijection::{Bijection, ZStdBijection, VIntBijection, U24Bijection, PositiveDeltaBijection, U64DeltaBijection};
+use bijection::{Bijection, ZStdBijection, VIntBijection, U24Bijection, PositiveDeltaBijection, U64DeltaBijection, MonotonicPermutationBijection};
 use columnar::{ColumnarEvents, EventsToColumns, ParsedEvent, ParseBijection};
 use ans::AnsBijection;
-use timestamp::TimestampCodec;
 use bytes::Bytes;
 use std::borrow::Cow;
 use std::error::Error;
@@ -43,15 +42,15 @@ impl EventCodec for FulmicotonCodec {
         let pos_delta = PositiveDeltaBijection;
         let u64_delta = U64DeltaBijection;
         let ans = AnsBijection;
-        let ts_codec = TimestampCodec;
+        let perm = MonotonicPermutationBijection;
         
         // Compress columns
         let c_event_ids = zstd.apply(vint.apply(pos_delta.apply(cols.event_ids)));
         let c_event_type_indices = ans.apply(cols.event_type_indices);
         let c_dict_event_types = zstd.apply(cols.dict_event_types.join("\n").into_bytes());
         
-        // Timestamps: TimestampCodec (Permutation+Histogram+Ans) -> Zstd
-        let c_created_ats = zstd.apply(ts_codec.apply(cols.created_ats));
+        // Timestamps: MonotonicPermutationBijection (internal Histogram + AnsU64)
+        let c_created_ats = perm.apply(cols.created_ats);
         
         let c_repo_indices = zstd.apply(u24.apply(cols.repo_indices));
         let c_dict_repo_ids = zstd.apply(vint.apply(u64_delta.apply(cols.dict_repo_ids)));
@@ -76,7 +75,7 @@ impl EventCodec for FulmicotonCodec {
 
         // Concatenate with VInt lengths
         let mut final_buf = Vec::new();
-        let parts = vec![
+        let parts: Vec<Vec<u8>> = vec![
             c_event_ids, c_event_type_indices, c_dict_event_types, c_created_ats,
             c_repo_indices, c_dict_repo_ids, c_dict_repo_names
         ];
@@ -89,8 +88,7 @@ impl EventCodec for FulmicotonCodec {
         Ok(Bytes::from(final_buf))
     }
 
-    fn decode(&self, bytes: &[
-u8]) -> Result<Vec<(EventKey, EventValue)>, Box<dyn Error>> {
+    fn decode(&self, bytes: &[u8]) -> Result<Vec<(EventKey, EventValue)>, Box<dyn Error>> {
         let mut offset = 0;
         let mut read_part = || {
             let len = read_vint(bytes, &mut offset);
@@ -113,7 +111,7 @@ u8]) -> Result<Vec<(EventKey, EventValue)>, Box<dyn Error>> {
         let pos_delta = PositiveDeltaBijection;
         let u64_delta = U64DeltaBijection;
         let ans = AnsBijection;
-        let ts_codec = TimestampCodec;
+        let perm = MonotonicPermutationBijection;
 
         // Decode dictionary names (owners + suffixes)
         let names_bytes = zstd.revert(c_dict_repo_names);
@@ -157,8 +155,8 @@ u8]) -> Result<Vec<(EventKey, EventValue)>, Box<dyn Error>> {
             event_type_indices: ans.revert(c_event_type_indices),
             dict_event_types,
             
-            // Timestamps: Zstd -> TimestampCodec
-            created_ats: ts_codec.revert(zstd.revert(c_created_ats)),
+            // Timestamps: MonotonicPermutation Revert
+            created_ats: perm.revert(c_created_ats),
             
             repo_indices: u24.revert(zstd.revert(c_repo_indices)),
             

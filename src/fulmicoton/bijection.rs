@@ -1,5 +1,6 @@
 use std::error::Error;
 use super::algo::{identify_permutation, restore_permutation};
+use super::ans::{AnsBijection, AnsU64Bijection};
 
 pub trait Bijection<A, B> {
     fn apply(&self, source: A) -> B;
@@ -259,14 +260,16 @@ impl Bijection<Vec<i64>, Vec<u8>> for MonotonicPermutationBijection {
         
         let (sorted_u64, moves) = identify_permutation(values);
         
-        // Encode sorted values using Histogram
+        // Encode sorted values using Histogram -> ANS(u64)
         let hist = HistogramBijection;
-        let vint = VIntBijection;
+        let ans_u64 = AnsU64Bijection;
         let zstd = ZStdBijection;
         
         let sorted_i64: Vec<i64> = sorted_u64.iter().map(|&x| x as i64).collect();
         let hist_u64 = hist.apply(sorted_i64);
-        let sorted_bytes = zstd.apply(vint.apply(hist_u64));
+        
+        // Use AnsU64Bijection directly on hist_u64
+        let sorted_bytes = ans_u64.apply(hist_u64);
         
         // Encode moves: [Count][Adv...][Bub...] -> Zstd
         let mut moves_buf = Vec::new();
@@ -314,11 +317,11 @@ impl Bijection<Vec<i64>, Vec<u8>> for MonotonicPermutationBijection {
         let moves_compressed = read_part();
         
         let hist = HistogramBijection;
-        let vint = VIntBijection;
+        let ans_u64 = AnsU64Bijection;
         let zstd = ZStdBijection;
         
         // Decode sorted values
-        let hist_u64 = vint.revert(zstd.revert(sorted_bytes));
+        let hist_u64 = ans_u64.revert(sorted_bytes);
         let sorted_i64 = hist.revert(hist_u64);
         let values: Vec<u64> = sorted_i64.iter().map(|&x| x as u64).collect();
         
