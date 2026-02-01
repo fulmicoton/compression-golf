@@ -166,7 +166,7 @@ pub struct PositiveDeltaBijection;
 impl Bijection<Vec<i64>, Vec<u64>> for PositiveDeltaBijection {
     fn apply(&self, source: Vec<i64>) -> Vec<u64> {
         if source.is_empty() {
-            return vec![];
+            return Vec::new();
         }
         let mut deltas = Vec::with_capacity(source.len());
         let mut prev = 0;

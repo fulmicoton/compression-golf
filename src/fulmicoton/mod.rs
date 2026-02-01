@@ -1,6 +1,6 @@
 use crate::codec::EventCodec;
 use crate::{EventKey, EventValue};
-use ans::{Ans2048Bijection, AnsBijection};
+use ans::{Ans2048Bijection, AnsBijection, AnsU64Bijection};
 use bijection::ZStdBijection as GeneralCompression;
 use bijection::{
     Bijection, EliasFanoBijection, MonotonicPermutationBijection, PositiveDeltaBijection,
@@ -49,7 +49,14 @@ impl EventCodec for FulmicotonCodec {
         let perm = MonotonicPermutationBijection;
 
         // Compress columns
-        let c_event_ids = general_compression.apply(vint.apply(pos_delta.apply(cols.event_ids)));
+        // Event IDs: first delta as VInt, rest as AnsU64
+        let ans_u64 = AnsU64Bijection;
+        let deltas = pos_delta.apply(cols.event_ids);
+        let mut c_event_ids = Vec::new();
+        if !deltas.is_empty() {
+            write_vint(deltas[0] as usize, &mut c_event_ids);
+            c_event_ids.extend(ans_u64.apply(deltas[1..].to_vec()));
+        }
         let c_event_type_indices = ans.apply(cols.event_type_indices);
         let c_dict_event_types =
             general_compression.apply(cols.dict_event_types.join("\n").into_bytes());
@@ -165,8 +172,17 @@ impl EventCodec for FulmicotonCodec {
             et_names_str.split('\n').map(|s| s.to_string()).collect()
         };
 
+        // Decode event IDs: first delta as VInt, rest as AnsU64
+        let ans_u64 = AnsU64Bijection;
+        let mut delta_offset = 0;
+        let first_delta = read_vint(&c_event_ids, &mut delta_offset) as u64;
+        let rest_deltas = ans_u64.revert(c_event_ids[delta_offset..].to_vec());
+        let mut deltas = vec![first_delta];
+        deltas.extend(rest_deltas);
+        let event_ids = pos_delta.revert(deltas);
+
         let cols = ColumnarEvents {
-            event_ids: pos_delta.revert(vint.revert(general_compression.revert(c_event_ids))),
+            event_ids,
 
             event_type_indices: ans.revert(c_event_type_indices),
             dict_event_types,
