@@ -3,8 +3,8 @@ use crate::{EventKey, EventValue};
 use ans::{Ans2048Bijection, AnsBijection, AnsU64Bijection};
 use bijection::ZStdBijection as GeneralCompression;
 use bijection::{
-    Bijection, EliasFanoBijection, MonotonicPermutationBijection, PositiveDeltaBijection,
-    U24Bijection, U64DeltaBijection, VIntBijection,
+    BicBijection, Bijection, EliasFanoBijection, MonotonicPermutationBijection,
+    PositiveDeltaBijection, U24Bijection, U64DeltaBijection, VIntBijection,
 };
 use bytes::Bytes;
 use columnar::{ColumnarEvents, EventsToColumns, ParseBijection, ParsedEvent};
@@ -48,6 +48,10 @@ impl EventCodec for FulmicotonCodec {
         let ans = AnsBijection;
         let perm = MonotonicPermutationBijection;
 
+        // Output event IDs to JSON
+        let event_ids_json = serde_json::to_string(&cols.event_ids).unwrap();
+        std::fs::write("event_ids.json", event_ids_json).unwrap();
+
         // Compress columns
         // Event IDs: first delta as VInt, rest as AnsU64
         let ans_u64 = AnsU64Bijection;
@@ -66,9 +70,36 @@ impl EventCodec for FulmicotonCodec {
 
         // Hybrid encoding for repo indices: top 2047 via ANS, rest via U24+Zstd
         let c_repo_indices = encode_repo_indices_hybrid(&cols.repo_indices);
-        // Elias-Fano + Zstd encoding for sorted repo IDs
-        let elias_fano = EliasFanoBijection;
-        let c_dict_repo_ids = general_compression.apply(elias_fano.apply(cols.dict_repo_ids));
+        // BIC encoding for sorted repo IDs
+        // Separate unique IDs from duplicate indices (duplicates occur from repo renames)
+        let bic = BicBijection;
+        let mut unique_ids: Vec<u64> = Vec::new();
+        let mut dup_indices: Vec<u32> = Vec::new();
+        for (i, &id) in cols.dict_repo_ids.iter().enumerate() {
+            if i > 0 && id == cols.dict_repo_ids[i - 1] {
+                dup_indices.push(i as u32);
+            } else {
+                unique_ids.push(id);
+            }
+        }
+        let bic_encoded = bic.apply(unique_ids);
+        // Encode duplicate indices as delta + vint
+        let dup_deltas: Vec<u64> = if dup_indices.is_empty() {
+            vec![]
+        } else {
+            let mut deltas = vec![dup_indices[0] as u64];
+            for i in 1..dup_indices.len() {
+                deltas.push((dup_indices[i] - dup_indices[i-1]) as u64);
+            }
+            deltas
+        };
+        let dup_encoded = vint.apply(dup_deltas);
+        // Combine: [num_dups: u32][dup_encoded_len][dup_encoded][bic_encoded]
+        let mut c_dict_repo_ids = Vec::new();
+        c_dict_repo_ids.extend_from_slice(&(dup_indices.len() as u32).to_le_bytes());
+        write_vint(dup_encoded.len(), &mut c_dict_repo_ids);
+        c_dict_repo_ids.extend(dup_encoded);
+        c_dict_repo_ids.extend(bic_encoded);
 
         // Combine repo owners and suffixes
         let joined_owners = cols.dict_repo_owners.join("\n");
@@ -193,8 +224,47 @@ impl EventCodec for FulmicotonCodec {
             // Hybrid decoding for repo indices
             repo_indices: decode_repo_indices_hybrid(c_repo_indices),
 
-            // Elias-Fano + Zstd decoding for sorted repo IDs
-            dict_repo_ids: EliasFanoBijection.revert(general_compression.revert(c_dict_repo_ids)),
+            // BIC decoding for sorted repo IDs
+            dict_repo_ids: {
+                let mut offset = 0;
+                let num_dups = u32::from_le_bytes([
+                    c_dict_repo_ids[0], c_dict_repo_ids[1],
+                    c_dict_repo_ids[2], c_dict_repo_ids[3]
+                ]) as usize;
+                offset += 4;
+                let dup_len = read_vint(&c_dict_repo_ids, &mut offset);
+                let dup_encoded = &c_dict_repo_ids[offset..offset + dup_len];
+                offset += dup_len;
+                let bic_encoded = c_dict_repo_ids[offset..].to_vec();
+
+                // Decode duplicate indices from deltas
+                let dup_deltas = vint.revert(dup_encoded.to_vec());
+                let mut dup_indices: Vec<usize> = Vec::with_capacity(num_dups);
+                let mut pos = 0u64;
+                for delta in dup_deltas {
+                    pos += delta;
+                    dup_indices.push(pos as usize);
+                }
+
+                // Decode unique IDs
+                let unique_ids = BicBijection.revert(bic_encoded);
+
+                // Reconstruct full list by inserting duplicates
+                let total_len = unique_ids.len() + dup_indices.len();
+                let mut result = Vec::with_capacity(total_len);
+                let mut unique_iter = unique_ids.into_iter();
+                let mut dup_set: std::collections::HashSet<usize> = dup_indices.into_iter().collect();
+
+                for i in 0..total_len {
+                    if dup_set.contains(&i) {
+                        // Duplicate: copy previous value
+                        result.push(*result.last().unwrap());
+                    } else {
+                        result.push(unique_iter.next().unwrap());
+                    }
+                }
+                result
+            },
             dict_repo_owners,
             dict_repo_suffixes,
         };

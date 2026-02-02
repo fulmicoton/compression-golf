@@ -709,3 +709,219 @@ fn read_vint_local(bytes: &[u8], offset: &mut usize) -> usize {
     }
     n
 }
+
+/// Binary Interpolative Coding (BIC) for sorted sequences
+/// Recursively encodes middle elements using minimal bits based on range constraints
+pub struct BicBijection;
+
+impl Bijection<Vec<u64>, Vec<u8>> for BicBijection {
+    fn apply(&self, source: Vec<u64>) -> Vec<u8> {
+        if source.is_empty() {
+            return vec![];
+        }
+
+        let n = source.len() as u64;
+        let max_val = *source.last().unwrap();
+
+        let mut writer = BitWriter::new();
+
+        // Write header: n (u32) and max_val (u64)
+        writer.write_bits(source.len() as u64, 32);
+        writer.write_bits(max_val, 64);
+
+        // Recursively encode
+        bic_encode(&source, 0, max_val, &mut writer);
+
+        writer.finish()
+    }
+
+    fn revert(&self, source: Vec<u8>) -> Vec<u64> {
+        if source.is_empty() {
+            return vec![];
+        }
+
+        let mut reader = BitReader::new(&source);
+
+        let n = reader.read_bits(32) as usize;
+        let max_val = reader.read_bits(64);
+
+        let mut result = vec![0u64; n];
+        bic_decode(&mut result, 0, max_val, &mut reader);
+
+        result
+    }
+}
+
+fn bic_encode(values: &[u64], lo: u64, hi: u64, writer: &mut BitWriter) {
+    let n = values.len();
+    if n == 0 {
+        return;
+    }
+
+    let mid = n / 2;
+    let m = values[mid];
+
+    // Valid range for m: [lo + mid, hi - (n - 1 - mid)]
+    // We need mid elements in [lo, m-1] and (n-1-mid) elements in [m+1, hi]
+    let m_lo = lo + mid as u64;
+    let m_hi = hi - (n - 1 - mid) as u64;
+
+    // Number of possible values for m
+    let range = m_hi - m_lo + 1;
+
+    if range > 1 {
+        // Calculate bits needed
+        let bits = 64 - (range - 1).leading_zeros();
+        writer.write_bits(m - m_lo, bits as usize);
+    }
+    // If range == 1, m is fully determined, no bits needed
+
+    // Recurse on left and right halves
+    if mid > 0 {
+        bic_encode(&values[..mid], lo, m - 1, writer);
+    }
+    if mid + 1 < n {
+        bic_encode(&values[mid + 1..], m + 1, hi, writer);
+    }
+}
+
+fn bic_decode(values: &mut [u64], lo: u64, hi: u64, reader: &mut BitReader) {
+    let n = values.len();
+    if n == 0 {
+        return;
+    }
+
+    let mid = n / 2;
+
+    // Valid range for m
+    let m_lo = lo + mid as u64;
+    let m_hi = hi - (n - 1 - mid) as u64;
+
+    let range = m_hi - m_lo + 1;
+
+    let m = if range > 1 {
+        let bits = 64 - (range - 1).leading_zeros();
+        m_lo + reader.read_bits(bits as usize)
+    } else {
+        m_lo
+    };
+
+    values[mid] = m;
+
+    // Recurse on left and right halves
+    if mid > 0 {
+        bic_decode(&mut values[..mid], lo, m - 1, reader);
+    }
+    if mid + 1 < n {
+        bic_decode(&mut values[mid + 1..], m + 1, hi, reader);
+    }
+}
+
+struct BitWriter {
+    bytes: Vec<u8>,
+    current: u64,
+    bits_in_current: usize,
+}
+
+impl BitWriter {
+    fn new() -> Self {
+        BitWriter {
+            bytes: Vec::new(),
+            current: 0,
+            bits_in_current: 0,
+        }
+    }
+
+    fn write_bits(&mut self, value: u64, num_bits: usize) {
+        if num_bits == 0 {
+            return;
+        }
+
+        let mut value = value;
+        let mut remaining = num_bits;
+
+        while remaining > 0 {
+            let space = 64 - self.bits_in_current;
+            let to_write = remaining.min(space);
+
+            let mask = if to_write >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << to_write) - 1
+            };
+            self.current |= (value & mask) << self.bits_in_current;
+            self.bits_in_current += to_write;
+
+            if to_write < 64 {
+                value >>= to_write;
+            } else {
+                value = 0;
+            }
+            remaining -= to_write;
+
+            // Flush full bytes
+            while self.bits_in_current >= 8 {
+                self.bytes.push(self.current as u8);
+                self.current >>= 8;
+                self.bits_in_current -= 8;
+            }
+        }
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        if self.bits_in_current > 0 {
+            self.bytes.push(self.current as u8);
+        }
+        self.bytes
+    }
+}
+
+struct BitReader<'a> {
+    bytes: &'a [u8],
+    byte_pos: usize,
+    bit_pos: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        BitReader {
+            bytes,
+            byte_pos: 0,
+            bit_pos: 0,
+        }
+    }
+
+    fn read_bits(&mut self, num_bits: usize) -> u64 {
+        if num_bits == 0 {
+            return 0;
+        }
+
+        let mut result = 0u64;
+        let mut bits_read = 0;
+
+        while bits_read < num_bits {
+            if self.byte_pos >= self.bytes.len() {
+                break;
+            }
+
+            let bits_available_in_byte = 8 - self.bit_pos;
+            let bits_needed = num_bits - bits_read;
+            let bits_to_read = bits_available_in_byte.min(bits_needed);
+
+            let mask = ((1u16 << bits_to_read) - 1) as u8;
+            let bits = (self.bytes[self.byte_pos] >> self.bit_pos) & mask;
+
+            result |= (bits as u64) << bits_read;
+
+            bits_read += bits_to_read;
+            self.bit_pos += bits_to_read;
+
+            if self.bit_pos >= 8 {
+                self.bit_pos = 0;
+                self.byte_pos += 1;
+            }
+        }
+
+        result
+    }
+}

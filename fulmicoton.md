@@ -4,20 +4,21 @@ This document describes the implementation of the `fulmicoton` codec for the com
 
 ## Overview
 
-The codec achieves high compression (~5.93 MB for 1M events) by:
+The codec achieves high compression (~5.74 MB for 1M events) by:
 1.  **Parsing & Preprocessing**: Converting raw `(EventKey, EventValue)` pairs into a structured `ParsedEvent` format.
 2.  **Columnar Storage**: Transposing data into separate columns to maximize pattern matching within Zstd/ANS contexts.
 3.  **Monotonic Repair (Timestamps)**: Identifying and encoding the minimal set of "bubble swaps" needed to make the timestamp sequence strictly monotonic, enabling high-efficiency Histogram encoding.
-4.  **Specialized Entropy Coding**: 
-    *   Using **rANS (Asymmetric Numeral Systems)** for byte-aligned indices and large-integer histograms.
-    *   Using **Zstd (level 22)** for structured string data and sparse deltas.
+4.  **Specialized Entropy Coding**:
+    *   Using **rANS (Asymmetric Numeral Systems)** for byte-aligned indices, large-integer histograms, and u64 sequences.
+    *   Using **Elias-Fano** for sorted u64 sequences (repo IDs).
+    *   Using **Zstd (level 22)** for structured string data.
 5.  **Custom Binary Container**: Concatenating blobs with VInt-prefixed lengths to eliminate serialization overhead.
 
 ## Data Structure & Pipeline
 
 ### 1. Event IDs (`event_ids`)
-*   **Transformation**: `PositiveDelta -> VInt -> Zstd(22)`.
-*   **Rationale**: IDs are numeric strings that are strictly increasing when sorted by ID. Delta encoding reduces them to small integers.
+*   **Transformation**: `PositiveDelta -> [first as VInt] + [rest as AnsU64]`.
+*   **Rationale**: IDs are numeric strings that are strictly increasing when sorted by ID. Delta encoding reduces them to small integers. The first delta is encoded as VInt, while the remaining deltas use AnsU64 for near-optimal entropy coding.
 
 ### 2. Event Types (`event_types`)
 *   **Transformation**: `u8 index -> AnsBijection`.
@@ -32,25 +33,28 @@ The codec achieves high compression (~5.93 MB for 1M events) by:
     4.  **AnsU64**: The histogram counts are encoded using a specialized ANS implementation that handles `u64` symbols by mapping them to dense ranks.
 
 ### 4. Repositories
-*   **Dictionary Encoding**: deduplicates `(id, owner, suffix)` tuples.
-*   **Indices**: `U24 (3-byte) -> Zstd(22)`.
-*   **Metadata**: 
-    *   **IDs**: `U64Delta -> VInt -> Zstd(22)`.
+*   **Dictionary Encoding**: Deduplicates `(id, owner, suffix)` tuples.
+*   **Indices (Hybrid Encoding)**:
+    *   Top 2047 most frequent repos are mapped to ANS-2048 symbols.
+    *   Remaining repos use symbol 2047 ("other") and are stored separately using columnar U24 encoding (ANS for high byte, Zstd for low/mid bytes).
+    *   The mapping table is stored as `VInt -> Zstd`.
+*   **Metadata**:
+    *   **IDs**: `Elias-Fano -> Zstd(22)`. Elias-Fano provides near-optimal encoding for sorted sequences by splitting values into low bits (fixed-width packed) and high bits (unary-coded bitvector).
     *   **Names**: Splits "owner/repo" into two columns. Joins owners and suffixes with newlines, separates them with a null byte, and compresses the entire block with `Zstd(22)`. This allows Zstd to find repetitive owner strings across the entire dictionary.
 
 ## Final Serialization
 Concatenation of 7 blobs:
-1.  `event_ids` (Zstd)
+1.  `event_ids` (VInt + AnsU64)
 2.  `event_type_indices` (ANS)
 3.  `dict_event_types` (Zstd)
-4.  `created_ats` (Zstd/ANS - Permutation + Histogram)
-5.  `repo_indices` (Zstd)
-6.  `dict_repo_ids` (Zstd)
+4.  `created_ats` (Permutation + Histogram + AnsU64)
+5.  `repo_indices` (Hybrid: ANS-2048 + columnar U24)
+6.  `dict_repo_ids` (Elias-Fano + Zstd)
 7.  `dict_repo_names` (Zstd)
 
 Each blob is prefixed with its length as a VInt.
 
 ## Performance (vs Naive)
 *   **Naive Size**: 210,727,389 bytes
-*   **Fulmicoton Size**: ~5,930,460 bytes
-*   **Reduction**: ~97.2%
+*   **Fulmicoton Size**: ~5,736,674 bytes
+*   **Reduction**: ~97.3%
