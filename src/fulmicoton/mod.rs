@@ -1,6 +1,6 @@
 use crate::codec::EventCodec;
 use crate::{EventKey, EventValue};
-use ans::{Ans1024Bijection, Ans2048Bijection, AnsBijection};
+use ans::{AnsGenericBijection, AnsBijection};
 mod adaptive_mix;
 use bijection::ZStdBijection as GeneralCompression;
 use bijection::{
@@ -289,7 +289,7 @@ fn encode_repo_indices_hybrid(repo_indices: &[u64]) -> Vec<u8> {
     }
 
     // Encode using ANS
-    let ans = Ans2048Bijection;
+    let ans = AnsGenericBijection::<2048>;
     let c_symbols = ans.apply(symbols);
 
     // Encode "other" indices using columnar U24 (ANS on high byte, zstd on low/mid)
@@ -346,7 +346,7 @@ fn decode_repo_indices_hybrid(data: Vec<u8>) -> Vec<u64> {
     let top_repos = vint.revert(zstd.revert(c_mapping));
 
     // Decode ANS symbols
-    let ans = Ans2048Bijection;
+    let ans = AnsGenericBijection::<2048>;
     let symbols = ans.revert(c_symbols);
 
     // Decode "other" indices using columnar U24
@@ -470,7 +470,7 @@ fn encode_repo_names_hybrid(owners: &[String], suffixes: &[String]) -> Vec<u8> {
         return vec![];
     }
 
-    let ans = Ans1024Bijection;
+    let ans = AnsGenericBijection::<1024>;
 
     // === Encode owners with hybrid approach ===
     let mut owner_freq_map: HashMap<&str, usize> = HashMap::new();
@@ -581,7 +581,7 @@ fn decode_repo_names_hybrid(data: &[u8]) -> (Vec<String>, Vec<String>) {
     }
 
     let mut offset = 0;
-    let ans = Ans1024Bijection;
+    let ans = AnsGenericBijection::<1024>;
 
     let owner_symbols_len = read_vint(data, &mut offset);
     let c_owner_symbols = data[offset..offset + owner_symbols_len].to_vec();
