@@ -355,6 +355,153 @@ fn read_vint_local(bytes: &[u8], offset: &mut usize) -> usize {
     n
 }
 
+pub struct Ans1024Bijection;
+
+const SCALE_BITS_1024: u32 = 14;
+const SCALE_1024: u32 = 1 << SCALE_BITS_1024;
+const STATE_LOWER_BOUND_1024: u32 = 1 << 20;
+
+impl Bijection<Vec<u16>, Vec<u8>> for Ans1024Bijection {
+    fn apply(&self, source: Vec<u16>) -> Vec<u8> {
+        if source.is_empty() {
+            return vec![];
+        }
+
+        let mut counts = [0u32; 1024];
+        for &s in &source {
+            counts[s as usize] += 1;
+        }
+
+        let mut normalized_counts = [0u16; 1024];
+        let total = source.len() as u64;
+        let mut sum = 0u32;
+        let mut max_symbol = 0;
+        let mut max_count = 0;
+
+        for i in 0..1024 {
+            if counts[i] > 0 {
+                let mut c = (counts[i] as u64 * SCALE_1024 as u64 / total) as u32;
+                if c == 0 {
+                    c = 1;
+                }
+                normalized_counts[i] = c as u16;
+                sum += c;
+                if c > max_count {
+                    max_count = c;
+                    max_symbol = i;
+                }
+            }
+        }
+
+        if sum != SCALE_1024 {
+            let diff = SCALE_1024 as i32 - sum as i32;
+            let val = normalized_counts[max_symbol] as i32 + diff;
+            normalized_counts[max_symbol] = val as u16;
+        }
+
+        let mut starts = [0u32; 1024];
+        let mut current_start = 0;
+        for i in 0..1024 {
+            starts[i] = current_start;
+            current_start += normalized_counts[i] as u32;
+        }
+
+        let mut stream = Vec::new();
+        let mut x = STATE_LOWER_BOUND_1024;
+
+        for &symbol in source.iter().rev() {
+            let s = symbol as usize;
+            let freq = normalized_counts[s] as u32;
+            let start = starts[s];
+
+            let bound = freq << (20 + 8 - SCALE_BITS_1024);
+            while x >= bound {
+                stream.push(x as u8);
+                x >>= 8;
+            }
+
+            x = ((x / freq) << SCALE_BITS_1024) + (x % freq) + start;
+        }
+
+        let x_bytes = x.to_le_bytes();
+        // Header: 1024 * 2 bytes for counts + 4 bytes length + 4 bytes state
+        let mut result = Vec::with_capacity(1024 * 2 + 4 + 4 + stream.len());
+        for &c in &normalized_counts {
+            result.extend_from_slice(&c.to_le_bytes());
+        }
+        result.extend_from_slice(&(source.len() as u32).to_le_bytes());
+        result.extend_from_slice(&x_bytes);
+        result.extend(stream.iter().rev());
+        result
+    }
+
+    fn revert(&self, source: Vec<u8>) -> Vec<u16> {
+        if source.is_empty() {
+            return vec![];
+        }
+        let mut cursor = 0;
+        let mut normalized_counts = [0u16; 1024];
+        for i in 0..1024 {
+            let bytes = &source[cursor..cursor + 2];
+            normalized_counts[i] = u16::from_le_bytes([bytes[0], bytes[1]]);
+            cursor += 2;
+        }
+
+        let mut cum_freq = [0u32; 1025];
+        let mut sum = 0;
+        for i in 0..1024 {
+            cum_freq[i] = sum;
+            sum += normalized_counts[i] as u32;
+        }
+        cum_freq[1024] = sum;
+
+        let mut symbol_map = vec![0u16; SCALE_1024 as usize];
+        for s in 0..1024 {
+            let start = cum_freq[s] as usize;
+            let end = cum_freq[s + 1] as usize;
+            for i in start..end {
+                symbol_map[i] = s as u16;
+            }
+        }
+
+        let len_bytes = &source[cursor..cursor + 4];
+        let length =
+            u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
+        cursor += 4;
+
+        let state_bytes = &source[cursor..cursor + 4];
+        let mut x = u32::from_le_bytes([
+            state_bytes[0],
+            state_bytes[1],
+            state_bytes[2],
+            state_bytes[3],
+        ]);
+        cursor += 4;
+
+        let mut output = Vec::with_capacity(length);
+        let stream = &source[cursor..];
+        let mut stream_ptr = 0;
+
+        for _ in 0..length {
+            let slot = (x & (SCALE_1024 - 1)) as usize;
+            let s = symbol_map[slot];
+            output.push(s);
+            let freq = normalized_counts[s as usize] as u32;
+            let start = cum_freq[s as usize];
+            x = freq * (x >> SCALE_BITS_1024) + (x & (SCALE_1024 - 1)) - start;
+            while x < STATE_LOWER_BOUND_1024 {
+                if stream_ptr >= stream.len() {
+                    break;
+                }
+                let byte = stream[stream_ptr] as u32;
+                stream_ptr += 1;
+                x = (x << 8) | byte;
+            }
+        }
+        output
+    }
+}
+
 pub struct Ans2048Bijection;
 
 const SCALE_BITS_2048: u32 = 14;

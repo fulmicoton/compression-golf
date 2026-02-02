@@ -1,10 +1,11 @@
 use crate::codec::EventCodec;
 use crate::{EventKey, EventValue};
-use ans::{Ans2048Bijection, AnsBijection, AnsU64Bijection};
+use ans::{Ans1024Bijection, Ans2048Bijection, AnsBijection};
+mod adaptive_mix;
 use bijection::ZStdBijection as GeneralCompression;
 use bijection::{
-    BicBijection, Bijection, EliasFanoBijection, MonotonicPermutationBijection,
-    PositiveDeltaBijection, U24Bijection, U64DeltaBijection, VIntBijection,
+    AdaptiveMixBijection, AdaptiveMixU64Bijection, BicBijection, Bijection,
+    MonotonicPermutationBijection, PositiveDeltaBijection, U64DeltaBijection, VIntBijection,
 };
 use bytes::Bytes;
 use columnar::{ColumnarEvents, EventsToColumns, ParseBijection, ParsedEvent};
@@ -44,7 +45,6 @@ impl EventCodec for FulmicotonCodec {
         let general_compression = GeneralCompression;
         let vint = VIntBijection;
         let pos_delta = PositiveDeltaBijection;
-        let u64_delta = U64DeltaBijection;
         let ans = AnsBijection;
         let perm = MonotonicPermutationBijection;
 
@@ -53,13 +53,13 @@ impl EventCodec for FulmicotonCodec {
         std::fs::write("event_ids.json", event_ids_json).unwrap();
 
         // Compress columns
-        // Event IDs: first delta as VInt, rest as AnsU64
-        let ans_u64 = AnsU64Bijection;
+        // Event IDs: first delta as VInt, rest as AdaptiveMix
+        let adaptive_mix = AdaptiveMixU64Bijection;
         let deltas = pos_delta.apply(cols.event_ids);
         let mut c_event_ids = Vec::new();
         if !deltas.is_empty() {
             write_vint(deltas[0] as usize, &mut c_event_ids);
-            c_event_ids.extend(ans_u64.apply(deltas[1..].to_vec()));
+            c_event_ids.extend(adaptive_mix.apply(deltas[1..].to_vec()));
         }
         let c_event_type_indices = ans.apply(cols.event_type_indices);
         let c_dict_event_types =
@@ -85,7 +85,7 @@ impl EventCodec for FulmicotonCodec {
         let bic_encoded = bic.apply(unique_ids);
         // Encode duplicate indices as delta + vint
         let dup_deltas: Vec<u64> = if dup_indices.is_empty() {
-            vec![]
+            Vec::new()
         } else {
             let mut deltas = vec![dup_indices[0] as u64];
             for i in 1..dup_indices.len() {
@@ -101,15 +101,8 @@ impl EventCodec for FulmicotonCodec {
         c_dict_repo_ids.extend(dup_encoded);
         c_dict_repo_ids.extend(bic_encoded);
 
-        // Combine repo owners and suffixes
-        let joined_owners = cols.dict_repo_owners.join("\n");
-        let joined_suffixes = cols.dict_repo_suffixes.join("\n");
-        let mut combined_names = Vec::new();
-        combined_names.extend_from_slice(joined_owners.as_bytes());
-        combined_names.push(0); // Separator
-        combined_names.extend_from_slice(joined_suffixes.as_bytes());
-        let general_compression = GeneralCompression;
-        let c_dict_repo_names = general_compression.apply(combined_names);
+        // Hybrid encoding for repo suffixes: top 1023 via ANS, rest stored with owners
+        let c_dict_repo_names = encode_repo_names_hybrid(&cols.dict_repo_owners, &cols.dict_repo_suffixes);
 
         println!("Compressed Component Sizes:");
         println!("  event_ids:          {} bytes", c_event_ids.len());
@@ -164,35 +157,8 @@ impl EventCodec for FulmicotonCodec {
         let ans = AnsBijection;
         let perm = MonotonicPermutationBijection;
 
-        // Decode dictionary names (owners + suffixes)
-        let names_bytes = general_compression.revert(c_dict_repo_names);
-        let names_vec = names_bytes;
-        // Find separator
-        let sep_pos = names_vec
-            .iter()
-            .position(|&b| b == 0)
-            .expect("Missing separator in repo names");
-
-        let owners_bytes = &names_vec[..sep_pos];
-        let suffixes_bytes = &names_vec[sep_pos + 1..];
-
-        let owners_str = String::from_utf8(owners_bytes.to_vec())?;
-        let dict_repo_owners: Vec<String> = if owners_str.is_empty() {
-            Vec::new()
-        } else {
-            owners_str.split('\n').map(|s| s.to_string()).collect()
-        };
-
-        let suffixes_str = String::from_utf8(suffixes_bytes.to_vec())?;
-        let dict_repo_suffixes: Vec<String> = if suffixes_str.is_empty() {
-            if dict_repo_owners.is_empty() {
-                Vec::new()
-            } else {
-                vec!["".to_string(); dict_repo_owners.len()]
-            }
-        } else {
-            suffixes_str.split('\n').map(|s| s.to_string()).collect()
-        };
+        // Decode dictionary names (owners + suffixes with hybrid encoding)
+        let (dict_repo_owners, dict_repo_suffixes) = decode_repo_names_hybrid(&c_dict_repo_names);
 
         // Decode dictionary event types
         let et_names_bytes = general_compression.revert(c_dict_event_types);
@@ -203,11 +169,11 @@ impl EventCodec for FulmicotonCodec {
             et_names_str.split('\n').map(|s| s.to_string()).collect()
         };
 
-        // Decode event IDs: first delta as VInt, rest as AnsU64
-        let ans_u64 = AnsU64Bijection;
+        // Decode event IDs: first delta as VInt, rest as AdaptiveMix
+        let adaptive_mix = AdaptiveMixU64Bijection;
         let mut delta_offset = 0;
         let first_delta = read_vint(&c_event_ids, &mut delta_offset) as u64;
-        let rest_deltas = ans_u64.revert(c_event_ids[delta_offset..].to_vec());
+        let rest_deltas = adaptive_mix.revert(c_event_ids[delta_offset..].to_vec());
         let mut deltas = vec![first_delta];
         deltas.extend(rest_deltas);
         let event_ids = pos_delta.revert(deltas);
@@ -495,4 +461,196 @@ fn read_vint(bytes: &[u8], offset: &mut usize) -> usize {
         shift += 7;
     }
     n
+}
+
+const OTHER_NAME_SYMBOL: u16 = 1023;
+
+fn encode_repo_names_hybrid(owners: &[String], suffixes: &[String]) -> Vec<u8> {
+    if suffixes.is_empty() {
+        return vec![];
+    }
+
+    let ans = Ans1024Bijection;
+
+    // === Encode owners with hybrid approach ===
+    let mut owner_freq_map: HashMap<&str, usize> = HashMap::new();
+    for s in owners {
+        *owner_freq_map.entry(s.as_str()).or_insert(0) += 1;
+    }
+
+    let mut owner_freq_vec: Vec<(&str, usize)> = owner_freq_map.into_iter().collect();
+    owner_freq_vec.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let top_owner_count = owner_freq_vec.len().min(1023);
+    let top_owners: Vec<&str> = owner_freq_vec.iter().take(top_owner_count).map(|(s, _)| *s).collect();
+
+    let mut owner_to_symbol: HashMap<&str, u16> = HashMap::new();
+    for (symbol, &owner) in top_owners.iter().enumerate() {
+        owner_to_symbol.insert(owner, symbol as u16);
+    }
+
+    let mut owner_symbols: Vec<u16> = Vec::with_capacity(owners.len());
+    let mut other_owners: Vec<&str> = Vec::new();
+
+    for s in owners {
+        if let Some(&symbol) = owner_to_symbol.get(s.as_str()) {
+            owner_symbols.push(symbol);
+        } else {
+            owner_symbols.push(OTHER_NAME_SYMBOL);
+            other_owners.push(s.as_str());
+        }
+    }
+
+    let c_owner_symbols = ans.apply(owner_symbols);
+
+    // === Encode suffixes with hybrid approach ===
+    let mut suffix_freq_map: HashMap<&str, usize> = HashMap::new();
+    for s in suffixes {
+        *suffix_freq_map.entry(s.as_str()).or_insert(0) += 1;
+    }
+
+    let mut suffix_freq_vec: Vec<(&str, usize)> = suffix_freq_map.into_iter().collect();
+    suffix_freq_vec.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let top_suffix_count = suffix_freq_vec.len().min(1023);
+    let top_suffixes: Vec<&str> = suffix_freq_vec.iter().take(top_suffix_count).map(|(s, _)| *s).collect();
+
+    let mut suffix_to_symbol: HashMap<&str, u16> = HashMap::new();
+    for (symbol, &suffix) in top_suffixes.iter().enumerate() {
+        suffix_to_symbol.insert(suffix, symbol as u16);
+    }
+
+    let mut suffix_symbols: Vec<u16> = Vec::with_capacity(suffixes.len());
+    let mut other_suffixes: Vec<&str> = Vec::new();
+
+    for s in suffixes {
+        if let Some(&symbol) = suffix_to_symbol.get(s.as_str()) {
+            suffix_symbols.push(symbol);
+        } else {
+            suffix_symbols.push(OTHER_NAME_SYMBOL);
+            other_suffixes.push(s.as_str());
+        }
+    }
+
+    let c_suffix_symbols = ans.apply(suffix_symbols);
+
+    // Combine all strings into one blob for zstd
+    // Format: top_owners\0other_owners\0top_suffixes\0other_suffixes
+    let joined_top_owners = top_owners.join("\n");
+    let joined_other_owners = other_owners.join("\n");
+    let joined_top_suffixes = top_suffixes.join("\n");
+    let joined_other_suffixes = other_suffixes.join("\n");
+
+    let mut combined = Vec::new();
+    combined.extend_from_slice(joined_top_owners.as_bytes());
+    combined.push(0);
+    combined.extend_from_slice(joined_other_owners.as_bytes());
+    combined.push(0);
+    combined.extend_from_slice(joined_top_suffixes.as_bytes());
+    combined.push(0);
+    combined.extend_from_slice(joined_other_suffixes.as_bytes());
+
+    let zstd = GeneralCompression;
+    let c_strings = zstd.apply(combined);
+
+    println!("    names hybrid breakdown:");
+    println!(
+        "      owner ANS:     {} bytes ({} top, {} other)",
+        c_owner_symbols.len(), top_owner_count, other_owners.len()
+    );
+    println!(
+        "      suffix ANS:    {} bytes ({} top, {} other)",
+        c_suffix_symbols.len(), top_suffix_count, other_suffixes.len()
+    );
+    println!("      strings blob:  {} bytes", c_strings.len());
+
+    // Combine: [len_owner_symbols][owner_symbols][len_suffix_symbols][suffix_symbols][strings_blob]
+    let mut result = Vec::new();
+    write_vint(c_owner_symbols.len(), &mut result);
+    result.extend(c_owner_symbols);
+    write_vint(c_suffix_symbols.len(), &mut result);
+    result.extend(c_suffix_symbols);
+    result.extend(c_strings);
+
+    result
+}
+
+fn decode_repo_names_hybrid(data: &[u8]) -> (Vec<String>, Vec<String>) {
+    if data.is_empty() {
+        return (vec![], vec![]);
+    }
+
+    let mut offset = 0;
+    let ans = Ans1024Bijection;
+
+    let owner_symbols_len = read_vint(data, &mut offset);
+    let c_owner_symbols = data[offset..offset + owner_symbols_len].to_vec();
+    offset += owner_symbols_len;
+
+    let suffix_symbols_len = read_vint(data, &mut offset);
+    let c_suffix_symbols = data[offset..offset + suffix_symbols_len].to_vec();
+    offset += suffix_symbols_len;
+
+    let c_strings = data[offset..].to_vec();
+
+    // Decode ANS symbols
+    let owner_symbols = ans.revert(c_owner_symbols);
+    let suffix_symbols = ans.revert(c_suffix_symbols);
+
+    // Decode combined strings blob
+    let zstd = GeneralCompression;
+    let strings_bytes = zstd.revert(c_strings);
+
+    // Find separators (4 sections = 3 separators)
+    let sep_positions: Vec<usize> = strings_bytes
+        .iter()
+        .enumerate()
+        .filter(|(_, &b)| b == 0)
+        .map(|(i, _)| i)
+        .collect();
+
+    let top_owners_bytes = &strings_bytes[..sep_positions[0]];
+    let other_owners_bytes = &strings_bytes[sep_positions[0] + 1..sep_positions[1]];
+    let top_suffixes_bytes = &strings_bytes[sep_positions[1] + 1..sep_positions[2]];
+    let other_suffixes_bytes = &strings_bytes[sep_positions[2] + 1..];
+
+    let parse_strings = |bytes: &[u8]| -> Vec<String> {
+        let s = String::from_utf8(bytes.to_vec()).unwrap();
+        if s.is_empty() {
+            vec![]
+        } else {
+            s.split('\n').map(|x| x.to_string()).collect()
+        }
+    };
+
+    let top_owners = parse_strings(top_owners_bytes);
+    let other_owners = parse_strings(other_owners_bytes);
+    let top_suffixes = parse_strings(top_suffixes_bytes);
+    let other_suffixes = parse_strings(other_suffixes_bytes);
+
+    // Reconstruct owners
+    let mut dict_repo_owners = Vec::with_capacity(owner_symbols.len());
+    let mut other_owner_iter = other_owners.into_iter();
+
+    for symbol in owner_symbols {
+        if symbol == OTHER_NAME_SYMBOL {
+            dict_repo_owners.push(other_owner_iter.next().expect("Missing 'other' owner"));
+        } else {
+            dict_repo_owners.push(top_owners[symbol as usize].clone());
+        }
+    }
+
+    // Reconstruct suffixes
+    let mut dict_repo_suffixes = Vec::with_capacity(suffix_symbols.len());
+    let mut other_suffix_iter = other_suffixes.into_iter();
+
+    for symbol in suffix_symbols {
+        if symbol == OTHER_NAME_SYMBOL {
+            dict_repo_suffixes.push(other_suffix_iter.next().expect("Missing 'other' suffix"));
+        } else {
+            dict_repo_suffixes.push(top_suffixes[symbol as usize].clone());
+        }
+    }
+
+    (dict_repo_owners, dict_repo_suffixes)
 }

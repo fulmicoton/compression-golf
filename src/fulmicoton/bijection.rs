@@ -3,6 +3,7 @@ use std::error::Error;
 
 use crate::zstd::ZstdCodec;
 
+use super::adaptive_mix::AdaptiveMixCoder;
 use super::algo::{identify_permutation, restore_permutation};
 use super::ans::AnsU64Bijection;
 
@@ -923,5 +924,114 @@ impl<'a> BitReader<'a> {
         }
 
         result
+    }
+}
+
+/// Adaptive arithmetic coding bijection for Vec<u8>
+pub struct AdaptiveMixBijection;
+
+impl Bijection<Vec<u8>, Vec<u8>> for AdaptiveMixBijection {
+    fn apply(&self, source: Vec<u8>) -> Vec<u8> {
+        if source.is_empty() {
+            return vec![];
+        }
+
+        let mut coder = AdaptiveMixCoder::new();
+        let encoded = coder.encode(&source);
+
+        // Prepend the length as u32
+        let mut result = Vec::with_capacity(4 + encoded.len());
+        result.extend_from_slice(&(source.len() as u32).to_le_bytes());
+        result.extend(encoded);
+        result
+    }
+
+    fn revert(&self, source: Vec<u8>) -> Vec<u8> {
+        if source.is_empty() {
+            return vec![];
+        }
+
+        let len = u32::from_le_bytes([source[0], source[1], source[2], source[3]]) as usize;
+        let encoded = &source[4..];
+
+        let mut coder = AdaptiveMixCoder::new();
+        coder.decode(encoded, len)
+    }
+}
+
+/// Adaptive arithmetic coding bijection for Vec<u64> (assumes values fit in u8)
+pub struct AdaptiveMixU64Bijection;
+
+impl Bijection<Vec<u64>, Vec<u8>> for AdaptiveMixU64Bijection {
+    fn apply(&self, source: Vec<u64>) -> Vec<u8> {
+        if source.is_empty() {
+            return vec![];
+        }
+
+        // Convert u64 to u8 (assumes all values fit)
+        let data: Vec<u8> = source.iter().map(|&v| v as u8).collect();
+
+        let mut coder = AdaptiveMixCoder::new();
+        let encoded = coder.encode(&data);
+
+        // Prepend the length as u32
+        let mut result = Vec::with_capacity(4 + encoded.len());
+        result.extend_from_slice(&(source.len() as u32).to_le_bytes());
+        result.extend(encoded);
+        result
+    }
+
+    fn revert(&self, source: Vec<u8>) -> Vec<u64> {
+        if source.is_empty() {
+            return vec![];
+        }
+
+        let len = u32::from_le_bytes([source[0], source[1], source[2], source[3]]) as usize;
+        let encoded = &source[4..];
+
+        let mut coder = AdaptiveMixCoder::new();
+        let decoded = coder.decode(encoded, len);
+
+        // Convert u8 back to u64
+        decoded.iter().map(|&v| v as u64).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_adaptive_mix_u64_bijection() {
+        let bij = AdaptiveMixU64Bijection;
+
+        // Test with typical delta values (small numbers)
+        let deltas: Vec<u64> = vec![1, 2, 1, 3, 1, 1, 2, 5, 1, 2, 1, 1, 3, 2, 1];
+        let encoded = bij.apply(deltas.clone());
+        let decoded = bij.revert(encoded);
+        assert_eq!(deltas, decoded);
+    }
+
+    #[test]
+    fn test_adaptive_mix_u64_bijection_large() {
+        let bij = AdaptiveMixU64Bijection;
+
+        // Test with larger data
+        let deltas: Vec<u64> = (0..10000).map(|i| ((i % 10) + 1) as u64).collect();
+        let encoded = bij.apply(deltas.clone());
+        let decoded = bij.revert(encoded.clone());
+        assert_eq!(deltas, decoded);
+
+        // Should compress well
+        assert!(encoded.len() < deltas.len(), "Expected compression");
+    }
+
+    #[test]
+    fn test_adaptive_mix_u64_bijection_empty() {
+        let bij = AdaptiveMixU64Bijection;
+        let empty: Vec<u64> = vec![];
+        let encoded = bij.apply(empty.clone());
+        let decoded = bij.revert(encoded);
+        assert_eq!(empty, decoded);
     }
 }
