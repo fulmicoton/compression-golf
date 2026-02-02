@@ -463,14 +463,16 @@ fn read_vint(bytes: &[u8], offset: &mut usize) -> usize {
     n
 }
 
-const OTHER_NAME_SYMBOL: u16 = 1023;
+// Configuration for hybrid name encoding
+const TOP_OWNERS_COUNT: usize = 1023;
+const OTHER_OWNER_SYMBOL: u16 = 1023;
+const TOP_SUFFIXES_COUNT: usize = 1023;
+const OTHER_SUFFIX_SYMBOL: u16 = 1023;
 
 fn encode_repo_names_hybrid(owners: &[String], suffixes: &[String]) -> Vec<u8> {
     if suffixes.is_empty() {
         return vec![];
     }
-
-    let ans = AnsGenericBijection::<1024>;
 
     // === Encode owners with hybrid approach ===
     let mut owner_freq_map: HashMap<&str, usize> = HashMap::new();
@@ -481,7 +483,7 @@ fn encode_repo_names_hybrid(owners: &[String], suffixes: &[String]) -> Vec<u8> {
     let mut owner_freq_vec: Vec<(&str, usize)> = owner_freq_map.into_iter().collect();
     owner_freq_vec.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
-    let top_owner_count = owner_freq_vec.len().min(1023);
+    let top_owner_count = owner_freq_vec.len().min(TOP_OWNERS_COUNT);
     let top_owners: Vec<&str> = owner_freq_vec.iter().take(top_owner_count).map(|(s, _)| *s).collect();
 
     let mut owner_to_symbol: HashMap<&str, u16> = HashMap::new();
@@ -496,12 +498,12 @@ fn encode_repo_names_hybrid(owners: &[String], suffixes: &[String]) -> Vec<u8> {
         if let Some(&symbol) = owner_to_symbol.get(s.as_str()) {
             owner_symbols.push(symbol);
         } else {
-            owner_symbols.push(OTHER_NAME_SYMBOL);
+            owner_symbols.push(OTHER_OWNER_SYMBOL);
             other_owners.push(s.as_str());
         }
     }
 
-    let c_owner_symbols = ans.apply(owner_symbols);
+    let c_owner_symbols = AnsGenericBijection::<1024>.apply(owner_symbols);
 
     // === Encode suffixes with hybrid approach ===
     let mut suffix_freq_map: HashMap<&str, usize> = HashMap::new();
@@ -512,7 +514,7 @@ fn encode_repo_names_hybrid(owners: &[String], suffixes: &[String]) -> Vec<u8> {
     let mut suffix_freq_vec: Vec<(&str, usize)> = suffix_freq_map.into_iter().collect();
     suffix_freq_vec.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
-    let top_suffix_count = suffix_freq_vec.len().min(1023);
+    let top_suffix_count = suffix_freq_vec.len().min(TOP_SUFFIXES_COUNT);
     let top_suffixes: Vec<&str> = suffix_freq_vec.iter().take(top_suffix_count).map(|(s, _)| *s).collect();
 
     let mut suffix_to_symbol: HashMap<&str, u16> = HashMap::new();
@@ -527,12 +529,12 @@ fn encode_repo_names_hybrid(owners: &[String], suffixes: &[String]) -> Vec<u8> {
         if let Some(&symbol) = suffix_to_symbol.get(s.as_str()) {
             suffix_symbols.push(symbol);
         } else {
-            suffix_symbols.push(OTHER_NAME_SYMBOL);
+            suffix_symbols.push(OTHER_SUFFIX_SYMBOL);
             other_suffixes.push(s.as_str());
         }
     }
 
-    let c_suffix_symbols = ans.apply(suffix_symbols);
+    let c_suffix_symbols = AnsGenericBijection::<1024>.apply(suffix_symbols);
 
     // Combine all strings into one blob for zstd
     // Format: top_owners\0other_owners\0top_suffixes\0other_suffixes
@@ -581,7 +583,6 @@ fn decode_repo_names_hybrid(data: &[u8]) -> (Vec<String>, Vec<String>) {
     }
 
     let mut offset = 0;
-    let ans = AnsGenericBijection::<1024>;
 
     let owner_symbols_len = read_vint(data, &mut offset);
     let c_owner_symbols = data[offset..offset + owner_symbols_len].to_vec();
@@ -593,9 +594,9 @@ fn decode_repo_names_hybrid(data: &[u8]) -> (Vec<String>, Vec<String>) {
 
     let c_strings = data[offset..].to_vec();
 
-    // Decode ANS symbols
-    let owner_symbols = ans.revert(c_owner_symbols);
-    let suffix_symbols = ans.revert(c_suffix_symbols);
+    // Decode ANS symbols with appropriate sizes
+    let owner_symbols = AnsGenericBijection::<1024>.revert(c_owner_symbols);
+    let suffix_symbols = AnsGenericBijection::<1024>.revert(c_suffix_symbols);
 
     // Decode combined strings blob
     let zstd = GeneralCompression;
@@ -633,7 +634,7 @@ fn decode_repo_names_hybrid(data: &[u8]) -> (Vec<String>, Vec<String>) {
     let mut other_owner_iter = other_owners.into_iter();
 
     for symbol in owner_symbols {
-        if symbol == OTHER_NAME_SYMBOL {
+        if symbol == OTHER_OWNER_SYMBOL {
             dict_repo_owners.push(other_owner_iter.next().expect("Missing 'other' owner"));
         } else {
             dict_repo_owners.push(top_owners[symbol as usize].clone());
@@ -645,7 +646,7 @@ fn decode_repo_names_hybrid(data: &[u8]) -> (Vec<String>, Vec<String>) {
     let mut other_suffix_iter = other_suffixes.into_iter();
 
     for symbol in suffix_symbols {
-        if symbol == OTHER_NAME_SYMBOL {
+        if symbol == OTHER_SUFFIX_SYMBOL {
             dict_repo_suffixes.push(other_suffix_iter.next().expect("Missing 'other' suffix"));
         } else {
             dict_repo_suffixes.push(top_suffixes[symbol as usize].clone());
